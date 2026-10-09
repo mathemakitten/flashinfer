@@ -102,6 +102,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             kind=self._kernel_config.kind,
             gate_up_clamp=_resolve_gate_up_clamp(self._kernel_config),
             activation_clamp=self._kernel_config.activation_clamp,
+            activation=self._kernel_config.activation,
         )
 
     def validate_transformed_weights(
@@ -117,6 +118,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             kind=self._kernel_config.kind,
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
+            activation=self._kernel_config.activation,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -139,6 +141,8 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            activation=k.activation,
+            clamped_relu2_limit=k.clamped_relu2_limit,
         )
 
     def validate_forward(
@@ -292,6 +296,8 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             fp.token_hidden_size,
             k.intermediate_size,
             k.kind,
+            k.activation,
+            k.clamped_relu2_limit,
             _resolve_gate_up_clamp(k),
             k.enable_in_kernel_fc2_reduce,
             knobs_pool_key(k.knobs),

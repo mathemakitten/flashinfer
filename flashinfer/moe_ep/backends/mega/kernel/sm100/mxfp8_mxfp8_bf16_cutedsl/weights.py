@@ -77,6 +77,7 @@ def preprocess_mega_weights(
     kind: Mxfp8Kind = "mxfp8_e4m3",
     gate_up_clamp: float | None = None,
     activation_clamp: float | None = None,
+    activation: Literal["swiglu", "clamped_relu2"] = "swiglu",
 ) -> TransformedMegaWeights:
     """bf16 (or pre-quantized) weights → MXFP8 + swizzled-SF mega layout."""
     import torch
@@ -91,7 +92,11 @@ def preprocess_mega_weights(
 
     del gate_up_clamp, activation_clamp  # MXFP8 weight quant uses a fixed 1.0 norm.
 
-    fc1_out = 2 * intermediate_size
+    if activation not in ("swiglu", "clamped_relu2"):
+        raise ValueError("unsupported activation")
+    fc1_out = (
+        intermediate_size if activation == "clamped_relu2" else 2 * intermediate_size
+    )
     num_experts = weights.w13.shape[0]
     data_dtype = _mxfp8_data_dtype(kind)
 
@@ -152,11 +157,19 @@ def preprocess_mega_weights(
                     f"packed MXFP8 weights must have dtype {data_dtype}; got "
                     f"{weights.w13.dtype} / {weights.w2.dtype}"
                 )
-            fc1_weight = _fc1_kernel_weight_from_canonical_mxfp8(
-                weights.w13, intermediate_size=intermediate_size
+            fc1_weight = (
+                weights.w13.transpose(1, 2).contiguous()
+                if activation == "clamped_relu2"
+                else _fc1_kernel_weight_from_canonical_mxfp8(
+                    weights.w13, intermediate_size=intermediate_size
+                )
             )
             fc2_weight = weights.w2.transpose(1, 2).contiguous()
-            w13_scale = _interleave_gate_up_32(w13_scale_in, intermediate_size=fc1_out)
+            w13_scale = (
+                w13_scale_in
+                if activation == "clamped_relu2"
+                else _interleave_gate_up_32(w13_scale_in, intermediate_size=fc1_out)
+            )
         else:
             raise ValueError(
                 "pre-quantized MXFP8 weights must be in kernel layout "
@@ -181,8 +194,10 @@ def preprocess_mega_weights(
                 f"w2 must have shape {logical_w2_shape}, got {tuple(weights.w2.shape)}"
             )
 
-        fc1_fp32 = _fc1_weight_from_w13(
-            weights.w13, intermediate_size=intermediate_size
+        fc1_fp32 = (
+            weights.w13.transpose(1, 2).contiguous()
+            if activation == "clamped_relu2"
+            else _fc1_weight_from_w13(weights.w13, intermediate_size=intermediate_size)
         )
         fc1_q_parts = []
         fc1_sf_parts = []
@@ -228,6 +243,7 @@ def validate_transformed_mega_weights(
     kind: Mxfp8Kind = "mxfp8_e4m3",
     world_size: int,
     num_experts: int,
+    activation: Literal["swiglu", "clamped_relu2"] = "swiglu",
 ) -> None:
     """One-time check for kernel-ready MXFP8 weights (``preprocess_weights=False``)."""
     import torch
@@ -246,7 +262,11 @@ def validate_transformed_mega_weights(
         )
 
     local_experts = num_experts // world_size
-    fc1_out = 2 * intermediate_size
+    if activation not in ("swiglu", "clamped_relu2"):
+        raise ValueError("unsupported activation")
+    fc1_out = (
+        intermediate_size if activation == "clamped_relu2" else 2 * intermediate_size
+    )
     data_dtype = _mxfp8_data_dtype(kind)
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).

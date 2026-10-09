@@ -37,6 +37,12 @@ files, no edits.** Every adaptation (path bootstrap, symbol re-exports, API
 shims) lives in `shim/`. A new drop is a pure replace of `src/`; the only work
 is updating `shim/` to whatever the new `src/` exposes.
 
+The opt-in NT4 development variant lives in `shim/nt4/`. Its owned copies
+adapt the non-gated FC1 width and clamped-ReLU2 epilogue; they must be audited
+against their original three files on every drop update. Read
+`shim/nt4/README.md` before changing them. They are not part of the verbatim
+drop and must not be overwritten when replacing `src/`.
+
 Layering: `moe_ep` backends import from the package (`__init__.py`) only →
 `__init__.py` re-exports from `shim/` → `shim/` imports the raw kernel packages
 from `src/` via sys.path (`shim/_paths.bootstrap_paths`).

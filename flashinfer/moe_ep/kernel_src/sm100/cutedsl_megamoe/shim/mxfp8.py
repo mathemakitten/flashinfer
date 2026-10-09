@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import math
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional, Tuple  # noqa: F401
@@ -72,8 +73,24 @@ class MegaMoEMxfp8Config:
     token_back_by_dispatch: bool = False
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
+    activation: Literal["swiglu", "clamped_relu2"] = "swiglu"
+    clamped_relu2_limit: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if self.activation not in ("swiglu", "clamped_relu2"):
+            raise ValueError("unsupported activation")
+        if self.activation == "clamped_relu2":
+            limit = self.clamped_relu2_limit
+            if limit is None or not math.isfinite(limit) or limit <= 0:
+                raise ValueError("clamped_relu2 requires a positive finite limit")
+            if self.gate_up_clamp is not None or self.intermediate % 256:
+                raise ValueError(
+                    "clamped_relu2 requires no gate clamp and intermediate divisible by 256"
+                )
+            if self.enable_in_kernel_fc2_reduce or self.in_kernel_fc2_reduce:
+                raise ValueError("clamped_relu2 requires separate top-k reduction")
+        elif self.clamped_relu2_limit is not None:
+            raise ValueError("clamped_relu2_limit requires clamped_relu2")
         if self.kind not in _KIND_TO_TORCH_DTYPE:
             raise ValueError(
                 f"kind must be one of {sorted(_KIND_TO_TORCH_DTYPE)}, "
@@ -153,7 +170,11 @@ class MegaMoEMxfp8Config:
 
     @property
     def fc1_out(self) -> int:
-        return 2 * self.intermediate
+        return (
+            self.intermediate
+            if self.activation == "clamped_relu2"
+            else 2 * self.intermediate
+        )
 
 
 @dataclasses.dataclass
@@ -370,6 +391,8 @@ class MegaMoEMxfp8Frontend:
             c.token_back_by_dispatch,
             self._gate_up_clamp,
             c.enable_iket,
+            c.activation,
+            c.clamped_relu2_limit,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoEMxfp8Inputs) -> _CompiledMega:
@@ -400,7 +423,12 @@ class MegaMoEMxfp8Frontend:
         max_active_clusters = max(1, sm_count // max(cluster_size, 1))
         group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
 
-        kernel = Sm100MegaMoEMxfp8Kernel(
+        kernel_type = Sm100MegaMoEMxfp8Kernel
+        if c.activation == "clamped_relu2":
+            from .nt4.megamoe_kernel_mxfp8 import Sm100Nt4MegaMoEMxfp8Kernel
+
+            kernel_type = Sm100Nt4MegaMoEMxfp8Kernel
+        kernel = kernel_type(
             mma_tiler_mnk=c.mma_tiler_mnk,
             cluster_shape_mnk=c.cluster_shape_mnk,
             use_2cta_instrs=c.use_2cta_instrs,
@@ -427,7 +455,11 @@ class MegaMoEMxfp8Frontend:
             ),
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
-            gate_up_clamp=self._gate_up_clamp,
+            gate_up_clamp=(
+                c.clamped_relu2_limit
+                if c.activation == "clamped_relu2"
+                else self._gate_up_clamp
+            ),
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -456,6 +488,39 @@ class MegaMoEMxfp8Frontend:
             compile_kwargs["options"] = "iket"
 
         mega.compiled = cute.compile(kernel, **compile_kwargs)
+        if not c.in_kernel_fc2_reduce:
+            from .clear_invalid_combine import ClearInvalidCombine
+
+            # FC1 applies the routing weights, so TopkReduce sums every slot
+            # without a mask. Dispatch skips invalid IDs and leaves their old
+            # combine values intact. Clear those slots on every invocation.
+            # Never write valid slots: a faster peer may already be sending
+            # this invocation's contributions. In particular, masked_fill_
+            # can read/write even unmasked elements and is unsafe here.
+            region = kernel._shared_region_by_name["combine_quant"]
+            combine = (
+                shared_workspace.narrow(
+                    0, kernel._shared_offsets["combine_quant"], region.nbytes
+                )
+                .view(torch.bfloat16)
+                .view(region.shape)
+            )
+            combine_cute = self._to_cute(combine)
+            clear = cute.compile(
+                ClearInvalidCombine(c.num_total_experts),
+                compile_kwargs["topk_idx"],
+                combine_cute,
+                compile_kwargs["stream"],
+            )
+            compiled = mega.compiled
+
+            def launch_with_clear(**kwargs):
+                clear(kwargs["topk_idx"], combine_cute, kwargs["stream"])
+                compiled(**kwargs)
+
+            # Both run() and make_launch_thunk() use this wrapper, including
+            # CUDA graph capture/replay. Compilation stays outside capture.
+            mega.compiled = launch_with_clear
         self._mega_key = key
         self._mega = mega
         return self._mega
@@ -786,6 +851,30 @@ class MegaMoEMxfp8SymmBuffer:
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
 
+    def debug_combine_snapshot(self) -> torch.Tensor:
+        """Copy per-route BF16 terms after a completed separate-reduce launch.
+
+        Diagnostic only: caller must order this after the launch and before
+        the next collective invocation. This does not launch a collective.
+        """
+        ensure_not_capturing("debug combine snapshot")
+        mega = self._frontend._mega
+        if self._destroyed or mega is None:
+            raise RuntimeError("debug snapshot requires a live, launched workspace")
+        if self._frontend.config.in_kernel_fc2_reduce:
+            raise RuntimeError("per-route terms are unavailable with atomic reduction")
+        if mega.kernel.combine_format.is_quantized:
+            raise RuntimeError("debug snapshot supports only BF16 combine")
+        region = mega.kernel._shared_region_by_name["combine_quant"]
+        return (
+            mega.shared_workspace.narrow(
+                0, mega.kernel._shared_offsets["combine_quant"], region.nbytes
+            )
+            .view(torch.bfloat16)
+            .view(region.shape)
+            .clone()
+        )
+
     def destroy(self) -> None:
         """Release symmetric-heap allocations and compiled kernel workspaces."""
         if self._destroyed:
@@ -815,6 +904,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
     knobs: Optional[dict] = None,
+    activation: Literal["swiglu", "clamped_relu2"] = "swiglu",
+    clamped_relu2_limit: Optional[float] = None,
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
 
@@ -850,6 +941,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         kind=kind,
+        activation=activation,
+        clamped_relu2_limit=clamped_relu2_limit,
         gate_up_clamp=clamp,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
@@ -860,6 +953,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     # key when present, else the measured MXFP8 heuristic (dtype="mxfp8"; no
     # tile knob -- MXFP8's mma_tiler is kernel-fixed at (256, 256)).  An
     # explicit knobs= dict overrides both entirely.
+    if knobs is None and activation == "clamped_relu2":
+        knobs = {}  # Do not reuse SwiGLU timing results for a non-gated kernel.
     if knobs is None:
         knobs, _ = resolve_knobs(
             dtype=kind,
@@ -877,9 +972,9 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     #   despite the autotuner supporting disabling ikr if it would be faster.
     #   ikr is taken as permission to violate batch invariance so selecting different knobs is fine
     #   We have now enabled varying the knobs here, revisit this if we see unexpected behavior
-    assert not cfg.in_kernel_fc2_reduce or cfg.enable_in_kernel_fc2_reduce, (
-        "in_kernel_fc2_reduce is not allowed when enable_in_kernel_fc2_reduce is False"
-    )
+    assert (
+        not cfg.in_kernel_fc2_reduce or cfg.enable_in_kernel_fc2_reduce
+    ), "in_kernel_fc2_reduce is not allowed when enable_in_kernel_fc2_reduce is False"
     frontend = MegaMoEMxfp8Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)

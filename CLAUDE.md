@@ -464,6 +464,13 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 
 ## Experimental Code
 
+The SM100 MXFP8 MegaMoE config has an explicit NT4 development variant:
+`activation="clamped_relu2", clamped_relu2_limit=16.0`. Its non-gated FC1
+adaptation lives under the kernel package's `shim/nt4/`, preserving the
+verbatim kernel-team `src/` drop. GPU qualification remains pending; use
+`examples/moe_ep/nt4_megamoe_bringup.md` for the staged GB300 validation sequence.
+It does not select itself automatically or enable an MCore integration.
+
 Experimental backends live under `flashinfer/experimental/`; experimental
 public APIs live in core marked with `@flashinfer_experimental_api` (defined in
 `flashinfer/api_logging.py`). Using them is an explicit opt-in: calling an
