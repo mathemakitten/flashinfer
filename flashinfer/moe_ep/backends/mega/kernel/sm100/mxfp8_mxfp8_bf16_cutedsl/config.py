@@ -41,7 +41,18 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     activation: Literal["swiglu", "clamped_relu2"] = "swiglu"
     clamped_relu2_limit: float | None = None
 
+    routing_weight_placement: Literal["before_quantization", "after_fc2"] = (
+        "before_quantization"
+    )
+
     def __post_init__(self) -> None:
+        if self.routing_weight_placement not in ("before_quantization", "after_fc2"):
+            raise ValueError("invalid routing_weight_placement")
+        if (
+            self.routing_weight_placement == "after_fc2"
+            and self.activation != "clamped_relu2"
+        ):
+            raise ValueError("after_fc2 is qualified only for clamped_relu2")
         if self.activation not in ("swiglu", "clamped_relu2"):
             raise ValueError("activation must be swiglu or clamped_relu2")
         if self.activation == "clamped_relu2":

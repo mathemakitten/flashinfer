@@ -143,6 +143,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
             activation=k.activation,
             clamped_relu2_limit=k.clamped_relu2_limit,
+            routing_weight_placement=k.routing_weight_placement,
         )
 
     def validate_forward(
@@ -298,6 +299,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             k.kind,
             k.activation,
             k.clamped_relu2_limit,
+            k.routing_weight_placement,
             _resolve_gate_up_clamp(k),
             k.enable_in_kernel_fc2_reduce,
             knobs_pool_key(k.knobs),

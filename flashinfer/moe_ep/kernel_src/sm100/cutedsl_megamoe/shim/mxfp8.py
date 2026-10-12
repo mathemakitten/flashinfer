@@ -76,7 +76,18 @@ class MegaMoEMxfp8Config:
     activation: Literal["swiglu", "clamped_relu2"] = "swiglu"
     clamped_relu2_limit: Optional[float] = None
 
+    routing_weight_placement: Literal["before_quantization", "after_fc2"] = (
+        "before_quantization"
+    )
+
     def __post_init__(self) -> None:
+        if self.routing_weight_placement not in ("before_quantization", "after_fc2"):
+            raise ValueError("invalid routing_weight_placement")
+        if (
+            self.routing_weight_placement == "after_fc2"
+            and self.activation != "clamped_relu2"
+        ):
+            raise ValueError("after_fc2 is qualified only for clamped_relu2")
         if self.activation not in ("swiglu", "clamped_relu2"):
             raise ValueError("unsupported activation")
         if self.activation == "clamped_relu2":
@@ -393,6 +404,7 @@ class MegaMoEMxfp8Frontend:
             c.enable_iket,
             c.activation,
             c.clamped_relu2_limit,
+            c.routing_weight_placement,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoEMxfp8Inputs) -> _CompiledMega:
@@ -448,6 +460,7 @@ class MegaMoEMxfp8Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
+            apply_topk_in_fc1=c.routing_weight_placement == "before_quantization",
             # kernel renamed the bool token_back_by_dispatch -> token_back_mode enum:
             # dispatch-reuse maps to "reuse_dispatch_warps", default to "epi_warps".
             token_back_mode=(
@@ -906,6 +919,9 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     knobs: Optional[dict] = None,
     activation: Literal["swiglu", "clamped_relu2"] = "swiglu",
     clamped_relu2_limit: Optional[float] = None,
+    routing_weight_placement: Literal[
+        "before_quantization", "after_fc2"
+    ] = "before_quantization",
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
 
@@ -943,6 +959,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         kind=kind,
         activation=activation,
         clamped_relu2_limit=clamped_relu2_limit,
+        routing_weight_placement=routing_weight_placement,
         gate_up_clamp=clamp,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
