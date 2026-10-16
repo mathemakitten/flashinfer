@@ -75,12 +75,26 @@ class MegaMoEMxfp8Config:
     enable_iket: bool = False
     activation: Literal["swiglu", "clamped_relu2"] = "swiglu"
     clamped_relu2_limit: Optional[float] = None
+    local_only: bool = False
+    return_contributions_only: bool = False
 
     routing_weight_placement: Literal["before_quantization", "after_fc2"] = (
         "before_quantization"
     )
 
     def __post_init__(self) -> None:
+        if self.return_contributions_only and (
+            not self.local_only
+            or self.activation != "clamped_relu2"
+            or self.routing_weight_placement != "after_fc2"
+            or self.in_kernel_fc2_reduce
+            or self.enable_in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "contribution-only output requires local NT4 late-weighted separate reduction"
+            )
+        if self.local_only and (self.world_size != 1 or self.rank != 0):
+            raise ValueError("local_only requires world_size=1 and rank=0")
         if self.routing_weight_placement not in ("before_quantization", "after_fc2"):
             raise ValueError("invalid routing_weight_placement")
         if (
@@ -142,10 +156,18 @@ class MegaMoEMxfp8Config:
                 "in_kernel_fc2_reduce and token_back_by_dispatch cannot both be True."
             )
         m, n, _k = self.mma_tiler_mnk
-        if (m, n) != (256, 256) or not self.use_2cta_instrs:
+        # Explicit NT4-only experiment: halve the cluster token tile while
+        # retaining 128 rows per CTA and the existing N/K/epilogue layouts.
+        nt4_m128 = (
+            self.activation == "clamped_relu2"
+            and tuple(self.mma_tiler_mnk) == (128, 256, 128)
+            and tuple(self.cluster_shape_mnk) == (1, 1, 1)
+            and not self.use_2cta_instrs
+        )
+        if not nt4_m128 and ((m, n) != (256, 256) or not self.use_2cta_instrs):
             raise ValueError(
                 "MXFP8 MegaMoE only supports mma_tiler (M, N) = (256, 256) with "
-                "use_2cta_instrs=True; "
+                "use_2cta_instrs=True, or explicit NT4 M128/N256/K128, cluster1, 1-CTA; "
                 f"got mma_tiler_mnk={self.mma_tiler_mnk}, "
                 f"use_2cta_instrs={self.use_2cta_instrs}."
             )
@@ -405,6 +427,9 @@ class MegaMoEMxfp8Frontend:
             c.activation,
             c.clamped_relu2_limit,
             c.routing_weight_placement,
+            c.local_only,
+            c.return_contributions_only,
+            os.environ.get("NT4_DEBUG_PREQUANT") == "1",
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoEMxfp8Inputs) -> _CompiledMega:
@@ -436,11 +461,15 @@ class MegaMoEMxfp8Frontend:
         group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
 
         kernel_type = Sm100MegaMoEMxfp8Kernel
+        nt4_kwargs = {}
         if c.activation == "clamped_relu2":
             from .nt4.megamoe_kernel_mxfp8 import Sm100Nt4MegaMoEMxfp8Kernel
 
             kernel_type = Sm100Nt4MegaMoEMxfp8Kernel
+            nt4_kwargs["skip_output_reduce"] = c.return_contributions_only
+            nt4_kwargs["debug_prequant"] = os.environ.get("NT4_DEBUG_PREQUANT") == "1"
         kernel = kernel_type(
+            **nt4_kwargs,
             mma_tiler_mnk=c.mma_tiler_mnk,
             cluster_shape_mnk=c.cluster_shape_mnk,
             use_2cta_instrs=c.use_2cta_instrs,
@@ -481,11 +510,20 @@ class MegaMoEMxfp8Frontend:
             dtype=torch.uint8,
             device="cuda",
         )
-        shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
-        symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace,
-            c.world_size,
-        )
+        if c.activation == "clamped_relu2" and kernel.debug_prequant:
+            spec = kernel._local_region_by_name["debug_prequant"]
+            local_workspace.narrow(
+                0, kernel._local_offsets["debug_prequant"], spec.nbytes
+            ).view(torch.float32).fill_(float("nan"))
+        if c.local_only:
+            shared_workspace = _local_zeros((shared_ws_bytes,), torch.uint8)
+            symmetric_base, peer_offsets_list = shared_workspace.data_ptr(), [0]
+        else:
+            shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
+            symmetric_base, peer_offsets_list = _compute_peer_offsets(
+                shared_workspace,
+                c.world_size,
+            )
 
         mega = _CompiledMega(
             compiled=None,
@@ -501,7 +539,7 @@ class MegaMoEMxfp8Frontend:
             compile_kwargs["options"] = "iket"
 
         mega.compiled = cute.compile(kernel, **compile_kwargs)
-        if not c.in_kernel_fc2_reduce:
+        if not c.in_kernel_fc2_reduce and not c.return_contributions_only:
             from .clear_invalid_combine import ClearInvalidCombine
 
             # FC1 applies the routing weights, so TopkReduce sums every slot
@@ -809,9 +847,18 @@ TransformedWeights = Tuple[torch.Tensor, torch.Tensor]
 Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
 
 
+def _local_zeros(shape, dtype):
+    """Explicit local allocation; never changes process-global NVSHMEM state."""
+    tensor = torch.zeros(shape, dtype=dtype, device="cuda")
+    tensor._mega_plain_alloc = True
+    return tensor
+
+
 def _sym_zeros_byte_view_1b(
     logical_shape: Tuple[int, ...],
     target_dtype: torch.dtype,
+    *,
+    local_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """fp8 / E8M0 symmetric heap via uint8 reinterpret (matches mega_runner).
 
@@ -820,7 +867,7 @@ def _sym_zeros_byte_view_1b(
     total_bytes = 1
     for dim_size in logical_shape:
         total_bytes *= dim_size
-    root = sym_zeros((total_bytes,), torch.uint8)
+    root = (_local_zeros if local_only else sym_zeros)((total_bytes,), torch.uint8)
     view = root.view(target_dtype).reshape(logical_shape)
     return view, root
 
@@ -863,6 +910,29 @@ class MegaMoEMxfp8SymmBuffer:
     _frontend: MegaMoEMxfp8Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
+
+    def local_contribution_view(self) -> torch.Tensor:
+        """Borrow BF16 route slots for local-only composition after a launch.
+
+        Stream-order consumers before the next launch. No snapshot or host sync;
+        the view is invalid after workspace reallocation/destruction.
+        In contributions-only mode, invalid route slots are not cleared and
+        may contain stale values or NaNs. Consumers must mask their loads by
+        the current route IDs; multiplying an invalid value by zero is unsafe.
+        """
+        if not self._frontend.config.local_only:
+            raise RuntimeError("local contribution view requires local_only")
+        mega = self._frontend._mega
+        if self._destroyed or mega is None:
+            raise RuntimeError("local contribution view requires a warm workspace")
+        region = mega.kernel._shared_region_by_name["combine_quant"]
+        return (
+            mega.shared_workspace.narrow(
+                0, mega.kernel._shared_offsets["combine_quant"], region.nbytes
+            )
+            .view(torch.bfloat16)
+            .view(region.shape)
+        )
 
     def debug_combine_snapshot(self) -> torch.Tensor:
         """Copy per-route BF16 terms after a completed separate-reduce launch.
@@ -922,6 +992,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     routing_weight_placement: Literal[
         "before_quantization", "after_fc2"
     ] = "before_quantization",
+    local_only: bool = False,
+    return_contributions_only: bool = False,
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
 
@@ -960,6 +1032,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         activation=activation,
         clamped_relu2_limit=clamped_relu2_limit,
         routing_weight_placement=routing_weight_placement,
+        local_only=local_only,
+        return_contributions_only=return_contributions_only,
         gate_up_clamp=clamp,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
@@ -1001,20 +1075,24 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
 
     sym_roots: list[torch.Tensor] = []
-    x, x_root = _sym_zeros_byte_view_1b((num_max_tokens, hidden), data_dtype)
+    allocate = _local_zeros if local_only else sym_zeros
+    x, x_root = _sym_zeros_byte_view_1b(
+        (num_max_tokens, hidden), data_dtype, local_only=local_only
+    )
     sym_roots.append(x_root)
     x_sf, x_sf_root = _sym_zeros_byte_view_1b(
         (num_max_tokens, hidden_sf_cols_padded),
         Mxfp8ScaleDtype,
+        local_only=local_only,
     )
     sym_roots.append(x_sf_root)
-    topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
+    topk_idx = allocate((num_max_tokens, num_topk), torch.int64)
     # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
     # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
     # tail, but start from the masked state so a partial first staging is safe.
     topk_idx.fill_(-1)
     sym_roots.append(topk_idx)
-    topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
+    topk_weights = allocate((num_max_tokens, num_topk), torch.float32)
     sym_roots.append(topk_weights)
     # Single 2D (T, hidden) bf16 output; the kernel reduces top-k internally.
     # Allocated on the symmetric heap unconditionally: under
@@ -1023,7 +1101,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     # explicit-reduce mode a sym allocation behaves like plain CUDA memory
     # locally.  Always-sym also lets apply_knobs flip the ikr knob per-compile
     # without reallocating.
-    output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
+    output_activation = allocate((num_max_tokens, hidden), torch.bfloat16)
     sym_roots.append(output_activation)
 
     return MegaMoEMxfp8SymmBuffer(
@@ -1144,7 +1222,14 @@ def mxfp8_mega_moe(
     # (T, hidden) output; no host-side form-A reduction is needed.  Launch the
     # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
     # live [:n] rows out -- matches the reference driver, which does not slice.
+    contributions_only = symm_buffer._frontend.config.return_contributions_only
+    if contributions_only and y is not None:
+        raise ValueError("contribution-only mode does not produce reduced output")
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
+    if contributions_only:
+        if sync and not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
+        return None
     if y is None:
         # Zero-copy: the caller consumes the workspace view under stream
         # ordering (valid until the next launch on this session's buffers).

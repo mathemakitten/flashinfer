@@ -126,14 +126,15 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                 f"got {load_balance_mode!r}."
             )
 
-        # Only (M=256, N=256) with 2-CTA instructions is validated now.
-        m, n, _k = mma_tiler_mnk
-        if (m, n) != (256, 256) or not use_2cta_instrs:
-            raise ValueError(
-                "Sm100ClampedRelu2Mxfp8Fc12Kernel only supports mma_tiler (M, N) = "
-                "(256, 256) with use_2cta_instrs=True; "
-                f"got mma_tiler_mnk={mma_tiler_mnk}, use_2cta_instrs={use_2cta_instrs}."
-            )
+        # The experimental M128 path keeps the per-CTA row layout unchanged.
+        # Admit only matched MMA/cluster pairs: scheduler readiness counters
+        # index token tiles using the same M as the dispatch path.
+        geometry = (tuple(mma_tiler_mnk), tuple(cluster_shape_mnk), use_2cta_instrs)
+        if geometry not in (
+            ((256, 256, 128), (2, 1, 1), True),
+            ((128, 256, 128), (1, 1, 1), False),
+        ):
+            raise ValueError(f"Unsupported NT4 experimental geometry: {geometry}")
 
         # Store ab_dtype so workspace-size helpers can use it without tensors.
         self.ab_dtype = ab_dtype
@@ -394,6 +395,15 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             combine_format=getattr(self, "combine_format", None),
         )
         self.epilogue = GluMxfp8Epilogue(**_epi_common)
+        # The epilogue is constructed here, not in the host constructor.
+        if getattr(self, "debug_prequant", False):
+            self.epilogue._debug_prequant_offset = self._local_offsets["debug_prequant"]
+            self.epilogue._debug_prequant_width = self._local_region_by_name[
+                "fc1_output"
+            ].shape[1]
+            self.epilogue._debug_prequant_rows = self._local_region_by_name[
+                "fc1_output"
+            ].shape[0]
 
         if self.num_sched_stages is None:
             self.num_sched_stages = 2
@@ -586,7 +596,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         sf_padding_block = self.sf_padding_block
         sf_vec_size = self.sf_vec_size
 
-        mma_tiler_n = self.mma_tiler_mnk[1]
+        token_tile_m = self.mma_tiler_mnk[0]
 
         data_total_rows, _hidden = fc1_activation_tensor.shape
         experts, _hidden_w, intermediate_gateup = fc1_weight_tensor.shape
@@ -608,8 +618,8 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
 
         # fc1_done_counter: one Int32 per global token block, plus expert slack.
         counter_slots_upper = (
-            data_total_rows + mma_tiler_n - 1
-        ) // mma_tiler_n + experts
+            data_total_rows + token_tile_m - 1
+        ) // token_tile_m + experts
         fc1_done_counter_bytes = counter_slots_upper * 4
 
         # load_balance_counter: Int32 scalar.

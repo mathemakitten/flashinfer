@@ -21,6 +21,7 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
 
+#include "nt4_block_cap.h"
 #include "cute/tensor.hpp"
 #include "cutlass/array.h"
 #include "cutlass/cutlass.h"
@@ -183,7 +184,8 @@ struct genericMoeGemmKernelLauncher {
       }
       TLLM_CHECK_WITH_INFO(occupancy > 0,
                            "GPU lacks the shared memory resources to run GroupedGEMM kernel");
-      int const threadblock_count = sm_count_ * occupancy;
+      // Persistent problem visitor advances by gridDim.x, preserving all tiles.
+      int const threadblock_count = flashinfer_nt4::limit(sm_count_ * occupancy);
 
       int const gemm_group_size = QuantOp == cutlass::WeightOnlyQuantOp::UNDEFINED
                                       ? inputs.k

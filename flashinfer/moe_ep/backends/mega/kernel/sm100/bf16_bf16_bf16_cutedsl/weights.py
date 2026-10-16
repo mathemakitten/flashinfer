@@ -43,11 +43,16 @@ def preprocess_mega_weights(
     *,
     intermediate_size: int,
     hidden_size: int,
+    activation: str = "swiglu",
 ) -> TransformedMegaWeights:
     """Convert canonical BF16 weights to the kernel's K-major layouts."""
     import torch
 
-    expected_w13 = (weights.w13.shape[0], 2 * intermediate_size, hidden_size)
+    expected_w13 = (
+        weights.w13.shape[0],
+        (intermediate_size if activation == "clamped_relu2" else 2 * intermediate_size),
+        hidden_size,
+    )
     expected_w2 = (weights.w2.shape[0], hidden_size, intermediate_size)
     if (
         tuple(weights.w13.shape) != expected_w13
@@ -59,7 +64,11 @@ def preprocess_mega_weights(
         )
     if weights.w13.dtype != torch.bfloat16 or weights.w2.dtype != torch.bfloat16:
         raise ValueError("BF16 MegaMoE requires bfloat16 canonical weights.")
-    fc1 = _interleave_gate_up_32(weights.w13, intermediate_size).transpose(1, 2)
+    fc1 = (
+        weights.w13.contiguous()
+        if activation == "clamped_relu2"
+        else _interleave_gate_up_32(weights.w13, intermediate_size)
+    ).transpose(1, 2)
     fc2 = weights.w2.transpose(1, 2)
     return (fc1, None), (fc2, None)
 
@@ -69,6 +78,7 @@ def validate_transformed_mega_weights(
     *,
     intermediate_size: int,
     hidden_size: int,
+    activation: str = "swiglu",
     world_size: int,
     num_experts: int,
 ) -> None:
@@ -80,7 +90,15 @@ def validate_transformed_mega_weights(
         raise ValueError("num_experts must be divisible by world_size.")
     local_experts = num_experts // world_size
     expected = (
-        (local_experts, hidden_size, 2 * intermediate_size),
+        (
+            local_experts,
+            hidden_size,
+            (
+                intermediate_size
+                if activation == "clamped_relu2"
+                else 2 * intermediate_size
+            ),
+        ),
         (local_experts, intermediate_size, hidden_size),
     )
     for (weight, scale), shape in zip(transformed, expected, strict=True):

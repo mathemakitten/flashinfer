@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "../nt4_block_cap.h"
 #include <cuda.h>
 #include <cuda_fp16.h>
 
@@ -575,7 +576,7 @@ using namespace cutlass::epilogue;
                                                                                                                                                                                                                                                                                                                         \
       cutlass::KernelHardwareInfo hw_info;                                                                                                                                                                                                                                                                              \
       hw_info.device_id = 0;                                                                                                                                                                                                                                                                                            \
-      hw_info.sm_count = multi_processor_count;                                                                                                                                                                                                                                                                         \
+      hw_info.sm_count = flashinfer_nt4::limit(multi_processor_count);                                                                                                                                                                                                                                                                         \
                                                                                                                                                                                                                                                                                                                         \
       if constexpr (DYNAMIC_CGA) {                                                                                                                                                                                                                                                                                      \
         TLLM_CHECK(cute::size<0>(dynamic_cluster_shape) >= 1);                                                                                                                                                                                                                                                          \
@@ -751,6 +752,12 @@ using namespace cutlass::epilogue;
                                                  hw_info,                                                                                                                                                                                                                                                               \
                                                  scheduler_args};                                                                                                                                                                                                                                                       \
                                                                                                                                                                                                                                                                                                                         \
+      if (flashinfer_nt4::max_blocks()) { \
+        auto grid = GemmGrouped::get_grid_shape(args, tma_ws_input.gemm_workspace); \
+        TLLM_CHECK_WITH_INFO(static_cast<uint64_t>(grid.x) * grid.y * grid.z <= \
+                            static_cast<uint64_t>(flashinfer_nt4::max_blocks()), \
+                            "CUTLASS scheduler exceeded the requested NT4 block cap"); \
+      } \
       size_t calculated_ws_size = gemm.get_workspace_size(args);                                                                                                                                                                                                                                                        \
       TLLM_CHECK_WITH_INFO(calculated_ws_size <= tma_ws_input.gemm_workspace_size,                                                                                                                                                                                                                                      \
                            "Workspace is size %zu but only %zu were allocated",                                                                                                                                                                                                                                         \

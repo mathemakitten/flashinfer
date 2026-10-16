@@ -80,6 +80,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
+            activation=self._kernel_config.activation,
         )
 
     def validate_transformed_weights(
@@ -92,6 +93,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
+            activation=self._kernel_config.activation,
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
         )
@@ -111,6 +113,8 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=_clamp(config),
+            activation=config.activation,
+            clamped_relu2_limit=config.clamped_relu2_limit,
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             knobs=config.knobs if isinstance(config.knobs, dict) else None,
         )
@@ -216,6 +220,8 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             fleet_params.token_hidden_size,
             config.intermediate_size,
             _clamp(config),
+            config.activation,
+            config.clamped_relu2_limit,
             config.enable_in_kernel_fc2_reduce,
             knobs_pool_key(config.knobs),
         )

@@ -191,6 +191,22 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "89", use_fast_build)
 
 
+def _nt4_block_cap_build_config(nvcc_flags, device_arch, module_name):
+    # One experimental binary for every cap (including the uncapped control).
+    # Runtime env is immutable after first use; each experiment uses a fresh process.
+    # Distinct module name prevents a stock AOT binary silently ignoring the cap.
+    if "NT4_CUTLASS_MAX_BLOCKS" in os.environ:
+        cap = int(os.environ["NT4_CUTLASS_MAX_BLOCKS"])
+        if device_arch != "103" or cap < 0 or cap > 4096 or cap % 16:
+            raise ValueError(
+                "NT4 block cap requires SM103 and 0 or a multiple of 16 <= 4096"
+            )
+        module_name = (module_name or f"fused_moe_{device_arch}") + "_nt4_blockcap_v1"
+        nvcc_flags = [*nvcc_flags, "-DFLASHINFER_NT4_BLOCK_CAP=1"]
+
+    return nvcc_flags, module_name
+
+
 def gen_cutlass_fused_moe_module(
     nvcc_flags: List[str],
     device_arch: str,
@@ -200,6 +216,10 @@ def gen_cutlass_fused_moe_module(
     """
     Generate a JitSpec for the cutlass fused moe module.
     """
+    nvcc_flags, module_name = _nt4_block_cap_build_config(
+        nvcc_flags, device_arch, module_name
+    )
+
     # Use FLASHINFER_GEN_SRC_DIR (user's writable cache) instead of FLASHINFER_CSRC_DIR
     # (package directory which may be read-only after installation)
     output_dir = (

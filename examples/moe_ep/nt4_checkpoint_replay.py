@@ -73,6 +73,7 @@ class Replay:
         routing_weight_placement="after_fc2",
         knobs=None,
     ):
+        self.knobs = {} if knobs is None else dict(knobs)
         self.routing_weight_placement = routing_weight_placement
         from flashinfer.moe_ep import (
             BootstrapConfig,
@@ -103,7 +104,7 @@ class Replay:
             clamped_relu2_limit=16.0,
             routing_weight_placement=routing_weight_placement,
             enable_in_kernel_fc2_reduce=False,
-            knobs={} if knobs is None else knobs,
+            knobs=self.knobs,
         )
         bootstrap = BootstrapConfig(
             world_size=4,
@@ -165,7 +166,9 @@ class Replay:
             )
         )
 
-    def reference(self, *, diagnose_input=False, diagnose_routing=False):
+    def reference(
+        self, *, diagnose_input=False, diagnose_routing=False, diagnose_term=None
+    ):
         from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
             mxfp8_quantize_per_block_32,
         )
@@ -189,6 +192,26 @@ class Replay:
         )
         terms = torch.zeros(self.capacity, 10, 768, device="cuda")
         products = torch.zeros_like(terms)
+        staged_terms = torch.zeros_like(terms)
+        staged_products = torch.zeros_like(terms)
+        from nt4_expert_diagnostics import (
+            snapshot_fc1_expert,
+            validate_intermediate,
+            fc1_activation_interval,
+            boundary_blocks,
+            decode_e8m0_exact,
+        )
+
+        all_ids = gather(self.ids.cpu(), self.group)
+        counts = (
+            torch.stack([torch.bincount(v[v >= 0], minlength=512) for v in all_ids])
+            .sum(0)
+            .tolist()
+        )
+        intermediate_errors = []
+        stage_metrics = dict(
+            changed_elements=0, changed_blocks=0, boundary_blocks=0, max_row_rel_l2=0.0
+        )
         late_terms = torch.zeros_like(terms) if diagnose_routing else None
         late_bf16_terms = torch.zeros_like(terms) if diagnose_routing else None
         x = roundtrip(self.x.float())
@@ -231,6 +254,59 @@ class Replay:
                     ),
                     group=self.group,
                 )
+            # All ranks participate even when this expert has no local source rows.
+            count = counts[e]
+            snapshot_error = None
+            if self.rank == owner:
+                try:
+                    metadata, q, sf = snapshot_fc1_expert(
+                        self.layer._ensure_workspace(),
+                        counts[owner * 128 : (owner + 1) * 128],
+                        local,
+                    )
+                    if os.environ.get("NT4_DEBUG_PREQUANT") == "1":
+                        from nt4_expert_diagnostics import snapshot_prequant_expert
+
+                        debug_values = snapshot_prequant_expert(
+                            self.layer._ensure_workspace(),
+                            counts[owner * 128 : (owner + 1) * 128],
+                            local,
+                        )
+                except Exception as error:
+                    snapshot_error = str(error)
+            errors = gather(snapshot_error, self.group)
+            if any(error is not None for error in errors):
+                raise RuntimeError(f"expert {e} intermediate snapshot failed: {errors}")
+            if self.rank != owner:
+                metadata = torch.empty(count, dtype=torch.int64, device="cuda")
+                q = torch.empty(count, 4096, dtype=torch.uint8, device="cuda")
+                sf = torch.empty(count, 128, dtype=torch.uint8, device="cuda")
+                if os.environ.get("NT4_DEBUG_PREQUANT") == "1":
+                    debug_values = torch.empty(
+                        count, 4, dtype=torch.float32, device="cuda"
+                    )
+            transferred = (metadata, q, sf)
+            if os.environ.get("NT4_DEBUG_PREQUANT") == "1":
+                transferred += (debug_values,)
+            for value in transferred:
+                dist.broadcast(
+                    value,
+                    src=(
+                        dist.get_global_rank(self.group, owner)
+                        if self.group is not None
+                        else owner
+                    ),
+                    group=self.group,
+                )
+            wanted = []
+            for source, source_ids in enumerate(all_ids):
+                for row, slot in (source_ids == e).nonzero().tolist():
+                    wanted.append((source << 48) | (slot << 32) | row)
+            ordered, order = metadata.sort()
+            if ordered.cpu().tolist() != sorted(wanted):
+                raise AssertionError(
+                    f"expert {e} intermediate source metadata mismatch"
+                )
             positions = (self.ids == e).nonzero()
             if not positions.numel():
                 continue
@@ -245,6 +321,184 @@ class Replay:
             a = roundtrip(activated)
             terms[rows, slots] = (a @ down.T).to(torch.bfloat16).float()
             products[rows, slots] = (a.double().abs() @ down.double().abs().T).float()
+            keys = (self.rank << 48) | (slots << 32) | rows
+            pool_rows = order[torch.searchsorted(ordered, keys)]
+            kernel_a = dequant(q[pool_rows], sf[pool_rows])
+            z64 = x[rows].double() @ up.double().T
+
+            def activate(value):
+                result = (16 * torch.tanh(torch.relu(value) / 16)).square()
+                if self.routing_weight_placement == "before_quantization":
+                    result = result * self.probs[rows, slots, None]
+                return result
+
+            variants = [
+                a,
+                roundtrip(activate(z64.float())),
+                roundtrip(activate(z64).float()),
+            ]
+            if os.environ.get("NT4_DEBUG_PREQUANT") == "1":
+                from nt4_expert_diagnostics import prequant_record
+
+                for probe, channel in enumerate((970, 1463)):
+                    for index in (
+                        (kernel_a[:, channel] != a[:, channel])
+                        .nonzero()
+                        .flatten()
+                        .tolist()
+                    ):
+                        pool_index = pool_rows[index]
+                        raw = debug_values[
+                            pool_index, probe * 2 : probe * 2 + 2
+                        ].tolist()
+                        scale = 2.0 ** (int(sf[pool_index, channel // 32]) - 127)
+                        try:
+                            detail = prequant_record(
+                                raw[0],
+                                raw[1],
+                                z64[index, channel].item(),
+                                activate(z64)[index, channel].item(),
+                                kernel_a[index, channel].item(),
+                                a[index, channel].item(),
+                                scale,
+                            )
+                            emit(
+                                stage="prequant_diagnostic",
+                                expert=e,
+                                row=int(rows[index]),
+                                slot=int(slots[index]),
+                                channel=channel,
+                                **detail,
+                            )
+                        except AssertionError as error:
+                            intermediate_errors.append(
+                                f"expert {e} prequant snapshot: {error}"
+                            )
+
+            def boundary_check():
+                lower, upper = fc1_activation_interval(x[rows], up, z64)
+
+                def quantize_interval(value):
+                    qv, sv = mxfp8_quantize_per_block_32(value, torch.float8_e4m3fn)
+                    return qv, sv.float()
+
+                diagnostics = []
+                exact = torch.zeros(
+                    kernel_a.numel() // 32, dtype=torch.bool, device=kernel_a.device
+                )
+                for variant in variants:
+                    exact |= (kernel_a.reshape(-1, 32) == variant.reshape(-1, 32)).all(
+                        -1
+                    )
+                result = boundary_blocks(
+                    kernel_a,
+                    variants[-1],
+                    lower,
+                    upper,
+                    decode_e8m0_exact(sf[pool_rows]),
+                    quantize_interval,
+                    diagnostics=diagnostics,
+                    diagnostic_mask=~exact,
+                )
+                for record in diagnostics:
+                    r = record["expert_row"]
+                    start = record["channel_start"]
+                    record["stored_scale_byte"] = int(sf[pool_rows[r], start // 32])
+                    record["stored_fp8_bytes"] = q[
+                        pool_rows[r], start : start + 32
+                    ].tolist()
+                    for detail in record["details"]:
+                        c = detail["channel"]
+                        detail["reference_fc1_fp64"] = z64[r, c].item()
+                        detail["reference_activation_fp64"] = activate(z64[r : r + 1])[
+                            0, c
+                        ].item()
+                    emit(
+                        stage="boundary_rejection_diagnostic",
+                        expert=e,
+                        row=int(rows[r]),
+                        slot=int(slots[r]),
+                        **record,
+                    )
+                return result
+
+            try:
+                m = validate_intermediate(
+                    kernel_a,
+                    variants,
+                    boundary=(
+                        boundary_check
+                        if self.routing_weight_placement == "after_fc2"
+                        else None
+                    ),
+                )
+                stage_metrics["boundary_blocks"] += m["boundary_blocks"]
+                stage_metrics["changed_elements"] += m["changed_elements"]
+                stage_metrics["changed_blocks"] += m["changed_blocks"]
+                stage_metrics["max_row_rel_l2"] = max(
+                    stage_metrics["max_row_rel_l2"], m["max_row_rel_l2"]
+                )
+            except AssertionError as error:
+                intermediate_errors.append(f"expert {e}: {error}")
+            staged_terms[rows, slots] = (
+                (kernel_a.double() @ down.double().T).to(torch.bfloat16).float()
+            )
+            staged_products[rows, slots] = (
+                kernel_a.double().abs() @ down.double().abs().T
+            ).float()
+            if diagnose_term is not None:
+                row, slot, channel = diagnose_term
+                matches = ((rows == row) & (slots == slot)).nonzero().flatten()
+                if matches.numel():
+                    from nt4_expert_diagnostics import diagnose_expert
+
+                    detail = diagnose_expert(
+                        x[rows],
+                        up,
+                        down,
+                        z,
+                        a,
+                        roundtrip,
+                        int(matches[0]),
+                        channel,
+                        weights=(
+                            self.probs[rows, slots]
+                            if self.routing_weight_placement == "before_quantization"
+                            else None
+                        ),
+                    )
+                    snapshot = self.diagnostic_fc1_snapshot
+                    kernel_a = torch.tensor(snapshot["intermediate"], device=a.device)
+                    changed = (kernel_a != a[int(matches[0])]).nonzero().flatten()
+                    kernel_dot = kernel_a.double() @ down[channel].double()
+                    detail["kernel_intermediate"] = dict(
+                        pool_row=snapshot["pool_row"],
+                        sf_row=snapshot["sf_row"],
+                        changed_elements_count=changed.numel(),
+                        fc2_fp64_dot=kernel_dot.item(),
+                        fc2_bf16=kernel_dot.to(torch.bfloat16).item(),
+                        changed_elements=[
+                            dict(
+                                channel=j,
+                                actual=kernel_a[j].item(),
+                                reference=a[int(matches[0]), j].item(),
+                                fp8_byte=snapshot["fp8_bytes"][j],
+                                scale_byte=snapshot["scale_bytes"][j // 32],
+                            )
+                            for j in changed[:16].tolist()
+                        ],
+                    )
+                    emit(
+                        stage="expert_reference_diagnostic",
+                        row=row,
+                        slot=slot,
+                        channel=channel,
+                        expert=e,
+                        owner=owner,
+                        routing_weight=self.probs[row, slot].item(),
+                        reference_term=terms[row, slot, channel].item(),
+                        **detail,
+                    )
             if diagnose_routing:
                 unweighted = roundtrip((16 * torch.tanh(torch.relu(z) / 16)).square())
                 fc2 = unweighted @ down.T
@@ -252,6 +506,22 @@ class Replay:
                 late_terms[rows, slots] = fc2 * p
                 late_bf16_terms[rows, slots] = fc2.to(torch.bfloat16).float() * p
         self.routing_diagnostics = {}
+        # Fail collectively after the broadcast loop; one failing rank must not
+        # leave peers blocked in the next expert's collective.
+        errors = gather(intermediate_errors, self.group)
+        if any(errors):
+            emit(stage="intermediate_validation", status="FAIL", errors=errors)
+            raise AssertionError(
+                "FC1 intermediate failed independent block-variant/boundary validation"
+            )
+        self.staged_terms = staged_terms
+        self.staged_products = staged_products
+        emit(
+            stage="intermediate_validation",
+            status="PASS",
+            validation="nt4_stagewise_v4_provisional",
+            **stage_metrics,
+        )
         if diagnose_routing:
             self.routing_diagnostics = {
                 "routing_after_fc2_fp32": late_terms.sum(1).to(torch.bfloat16),
@@ -270,6 +540,7 @@ class Replay:
         graph=False,
         diagnose_input=False,
         diagnose_routing=False,
+        diagnose_term=None,
     ):
         self.stage(sample)
         captured = sample["baseline"].cuda()
@@ -314,8 +585,62 @@ class Replay:
         torch.testing.assert_close(actual, run(), rtol=0, atol=0)
         torch.cuda.synchronize()
         terms = self.layer._ensure_workspace().debug_combine_snapshot().float()
+        if diagnose_term is not None:
+            row, slot, channel = diagnose_term
+            valid = row < self.n and int(self.ids[row, slot]) >= 0
+            if not all(gather(valid, self.group)):
+                raise ValueError(
+                    "diagnostic coordinate must select an active expert slot"
+                )
+            from nt4_expert_diagnostics import snapshot_fc1
+
+            requests = gather(int(self.ids[row, slot]), self.group)
+            all_counts = gather(
+                torch.bincount(self.ids[self.ids >= 0], minlength=512).cpu().tolist(),
+                self.group,
+            )
+            counts = [
+                sum(c[e] for c in all_counts)
+                for e in range(self.rank * 128, (self.rank + 1) * 128)
+            ]
+            snapshots = {}
+            snapshot_error = None
+            try:
+                for source, expert in enumerate(requests):
+                    owner, local = divmod(expert, 128)
+                    if owner == self.rank:
+                        snapshots[source] = snapshot_fc1(
+                            self.layer._ensure_workspace(),
+                            counts,
+                            local,
+                            source,
+                            row,
+                            slot,
+                        )
+            except Exception as error:
+                snapshot_error = str(error)
+            reports = gather(
+                dict(snapshots=snapshots, error=snapshot_error), self.group
+            )
+            if any(r["error"] is not None for r in reports):
+                raise RuntimeError(
+                    f"kernel intermediate snapshot failed: {[r['error'] for r in reports]}"
+                )
+            self.diagnostic_fc1_snapshot = reports[requests[self.rank] // 128][
+                "snapshots"
+            ][self.rank]
+            emit(
+                stage="expert_kernel_term",
+                row=row,
+                slot=slot,
+                channel=channel,
+                expert=int(self.ids[row, slot]),
+                actual=terms[row, slot, channel].item(),
+            )
         expected, reference_terms, abs_products = self.reference(
-            diagnose_input=diagnose_input, diagnose_routing=diagnose_routing
+            diagnose_input=diagnose_input,
+            diagnose_routing=diagnose_routing,
+            diagnose_term=diagnose_term,
         )
         for label, candidate in self.routing_diagnostics.items():
             # Diagnostic hypotheses only: never substitute for the correctness gate.
@@ -323,29 +648,58 @@ class Replay:
                 compare(captured, candidate[: self.n], "diagnostic_" + label)
             except AssertionError as error:
                 emit(stage="routing_diagnostic_failure", label=label, error=str(error))
-        metrics = validate_contributions(
-            actual,
-            expected,
-            terms,
-            reference_terms,
-            self.ids,
-            abs_products,
-            4096,
-            routing_weights=(
-                self.probs if self.routing_weight_placement == "after_fc2" else None
-            ),
+        if diagnose_term is not None:
+            for lhs, rhs, label in (
+                (captured, expected[: self.n], "diagnostic_baseline_vs_reference"),
+                (actual[: self.n], captured, "diagnostic_megamoe_vs_baseline"),
+            ):
+                try:
+                    compare(lhs, rhs, label)
+                except AssertionError as error:
+                    emit(stage="diagnostic_comparison_failure", error=str(error))
+        staged_expected = (
+            weighted_bf16_recombine(self.staged_terms, self.probs)
+            if self.routing_weight_placement == "after_fc2"
+            else self.staged_terms.sum(1).to(torch.bfloat16)
         )
+        comparison_errors = []
+        metrics = {}
+        try:
+            metrics = validate_contributions(
+                actual,
+                staged_expected,
+                terms,
+                self.staged_terms,
+                self.ids,
+                self.staged_products,
+                4096,
+                routing_weights=(
+                    self.probs if self.routing_weight_placement == "after_fc2" else None
+                ),
+            )
+            # Preserve the independent original-reference aggregate gates too.
+            expert_rel = (terms - reference_terms).norm(dim=-1) / reference_terms.norm(
+                dim=-1
+            ).clamp_min(1e-8)
+            if bool((expert_rel > 0.015).any()):
+                raise AssertionError(
+                    "original-reference per-expert vector relative L2 exceeds 0.015"
+                )
+            metrics["original_reference_expert_max_rel_l2"] = expert_rel.max().item()
+        except AssertionError as error:
+            comparison_errors.append(str(error))
         emit(
             stage="contribution_validation",
             routing_weight_placement=self.routing_weight_placement,
-            validation="bf16_fp32_contributions_v2",
-            status="PASS",
+            validation="nt4_stagewise_v4_provisional",
+            status="FAIL" if comparison_errors else "PASS",
+            errors=comparison_errors.copy(),
             **metrics,
         )
         # Report both sides of the comparison before failing: a baseline/oracle
         # disagreement must not hide the direct MegaMoE/baseline measurement.
-        comparison_errors = []
         for lhs, rhs, label in (
+            (actual, expected, "megamoe_vs_independent_reference"),
             (captured, expected[: self.n], "captured_baseline_vs_reference"),
             (actual[: self.n], captured, "megamoe_vs_baseline"),
         ):
@@ -353,15 +707,16 @@ class Replay:
                 compare(lhs, rhs, label)
             except AssertionError as error:
                 comparison_errors.append(str(error))
-        if comparison_errors:
-            raise AssertionError("; ".join(comparison_errors))
+        peer_errors = gather(comparison_errors, self.group)
+        if any(peer_errors):
+            raise AssertionError(f"stagewise validation failed: {peer_errors}")
         if bool((actual[self.n :] != 0).any()):
             raise AssertionError("nonzero padded output")
         emit(
             stage="correctness",
             status="PASS",
             graph=graph,
-            validation="bf16_fp32_contributions_v2",
+            validation="nt4_stagewise_v4_provisional",
             **metrics,
         )
 
@@ -372,11 +727,23 @@ class Replay:
         finalize_moe_ep_runtime(self.runtime)
 
 
-def benchmark(replay, baseline, *, graph=False, warmup=20, iterations=100, rounds=5):
+def benchmark(
+    replay, baseline, *, graph=False, warmup=20, iterations=100, rounds=5, hybrid=None
+):
     """Call only after correctness. No snapshots, references or host copies in calls."""
+    if os.environ.get("NT4_DEBUG_PREQUANT") == "1":
+        raise RuntimeError("instrumented prequant kernel must not be benchmarked")
     functions = {"megamoe": replay.run}
     if baseline is not None:
         functions = {"baseline": baseline, **functions}
+    if hybrid is not None:
+        if baseline is None:
+            raise ValueError("three-way timing requires a live CUTLASS baseline")
+        functions = {
+            "nvls_cutlass": baseline,
+            "nvls_megamoe": hybrid,
+            "direct_megamoe": replay.run,
+        }
     graphs = []
     for name, fn in list(functions.items()):
         for _ in range(warmup):
@@ -393,7 +760,16 @@ def benchmark(replay, baseline, *, graph=False, warmup=20, iterations=100, round
     walls = {name: [] for name in functions}
     torch.cuda.reset_peak_memory_stats()
     for round_id in range(rounds):
-        for name in list(functions)[:: 1 if round_id % 2 == 0 else -1]:
+        names = list(functions)
+        if hybrid is not None:
+            # Rotate first position across all three backends, then reverse it.
+            shift = round_id % len(names)
+            names = names[shift:] + names[:shift]
+            if (round_id // len(names)) % 2:
+                names.reverse()
+        else:
+            names = names[:: 1 if round_id % 2 == 0 else -1]
+        for name in names:
             events = [
                 (
                     torch.cuda.Event(enable_timing=True),
@@ -422,7 +798,12 @@ def benchmark(replay, baseline, *, graph=False, warmup=20, iterations=100, round
             p95_us=torch.quantile(values, 0.95).item(),
             batch_wall_us=walls[name],
         )
-    if baseline is not None:
+    if hybrid is not None:
+        report["speedups_vs_nvls_cutlass"] = {
+            name: report["nvls_cutlass"]["median_us"] / report[name]["median_us"]
+            for name in ("nvls_megamoe", "direct_megamoe")
+        }
+    elif baseline is not None:
         report["baseline_over_megamoe"] = (
             report["baseline"]["median_us"] / report["megamoe"]["median_us"]
         )
@@ -435,23 +816,37 @@ def benchmark(replay, baseline, *, graph=False, warmup=20, iterations=100, round
     report["peak_reserved_bytes"] = max(
         gather(torch.cuda.max_memory_reserved(), replay.group)
     )
-    report["memory_scope"] = "whole process including loaded model and both backends"
+    report["memory_scope"] = (
+        "whole process including resident weights and all instantiated backends"
+    )
     emit(stage="benchmark", **report)
     return report
 
 
-def profile_layers(replay, destination, *, baseline=None, graph=True, iterations=10):
+def profile_layers(
+    replay, destination, *, baseline=None, hybrid=None, graph=True, iterations=10
+):
     """Export per-rank Chrome traces after correctness and compilation warmup.
 
     Trace timings are diagnostic, not a replacement for unprofiled benchmarks.
     """
     from torch.profiler import ProfilerActivity, profile, record_function
 
+    if os.environ.get("NT4_DEBUG_PREQUANT") == "1":
+        raise RuntimeError("instrumented prequant kernel must not be profiled")
+    if hybrid is not None and baseline is None:
+        raise ValueError("three-way profiling requires the live production baseline")
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     functions = {"megamoe": replay.run}
     if baseline is not None:
         functions = {"baseline": baseline, **functions}
+    if hybrid is not None:
+        functions = {
+            "nvls_cutlass": baseline,
+            "nvls_megamoe": hybrid,
+            "direct_megamoe": replay.run,
+        }
     for name, fn in functions.items():
         for _ in range(20):
             fn()
@@ -472,6 +867,15 @@ def profile_layers(replay, destination, *, baseline=None, graph=True, iterations
             record_shapes=False,
             with_stack=False,
         ) as prof:
+            # Profiler startup is not simultaneous across ranks. Keep its peer
+            # waits out of the measured replay ranges, and explicitly label the
+            # startup work so trace analysis can exclude it.
+            with record_function(f"nt4/{name}/profiler_warmup"):
+                dist.barrier(group=replay.group)
+                for _ in range(2):
+                    run()
+                torch.cuda.synchronize()
+                dist.barrier(group=replay.group)
             for iteration in range(iterations):
                 with record_function(f"nt4/{name}/iteration_{iteration}"):
                     run()
@@ -493,6 +897,9 @@ def main():
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--graph", action="store_true")
     parser.add_argument(
+        "--sample-index", type=int, help="replay only this saved sample (zero-based)"
+    )
+    parser.add_argument(
         "--knobs-json",
         default="{}",
         help="explicit NT4 scheduling knobs; bypasses tuning cache",
@@ -513,6 +920,18 @@ def main():
         default="after_fc2",
     )
     parser.add_argument("--diagnose-input-quantization", action="store_true")
+    parser.add_argument(
+        "--diagnose-prequant",
+        action="store_true",
+        help="compile instrumented NT4 kernel for channels 970/1463; no timing",
+    )
+    parser.add_argument(
+        "--diagnose-expert-term",
+        type=int,
+        nargs=3,
+        metavar=("ROW", "SLOT", "CHANNEL"),
+        help="log FP64 reference sensitivity for one contribution; retains all gates",
+    )
     parser.add_argument("--diagnose-routing-weight-placement", action="store_true")
     parser.add_argument(
         "--allow-incomplete",
@@ -521,6 +940,23 @@ def main():
     )
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     args = parser.parse_args()
+    if args.sample_index is not None and args.sample_index < 0:
+        parser.error("sample-index must be nonnegative")
+    if args.diagnose_prequant:
+        os.environ["NT4_DEBUG_PREQUANT"] = "1"
+    if os.environ.get("NT4_DEBUG_PREQUANT") == "1":
+        if args.benchmark_megamoe or args.profile_dir:
+            parser.error("prequant instrumentation cannot be benchmarked or profiled")
+        if args.routing_weight_placement != "after_fc2":
+            parser.error("prequant diagnostics currently require after_fc2 routing")
+        emit_record = dict(
+            stage="debug_prequant_enabled", channels=[970, 1463], timing_allowed=False
+        )
+        print(json.dumps(emit_record), flush=True)
+    if args.diagnose_expert_term is not None:
+        row, slot, channel = args.diagnose_expert_term
+        if row < 0 or not 0 <= slot < 10 or not 0 <= channel < 768:
+            parser.error("diagnostic coordinate requires row>=0, slot<10, channel<768")
     from nt4_gb300_tune import validate_knobs
 
     try:
@@ -568,6 +1004,10 @@ def main():
     counts = gather(len(samples))
     if min(counts) == 0 or min(counts) != max(counts):
         raise ValueError("incomplete artifact sample set")
+    if args.sample_index is not None and args.sample_index >= len(samples):
+        raise ValueError(
+            f"sample-index {args.sample_index} is absent; artifact has {len(samples)} samples"
+        )
     capacity = max(gather(max(s["x"].shape[0] for s in samples)))
     replay = Replay(
         weights,
@@ -587,6 +1027,8 @@ def main():
         cuda=torch.version.cuda,
     )
     for i, sample in enumerate(samples):
+        if args.sample_index is not None and i != args.sample_index:
+            continue
         emit(
             stage="sample",
             sample=i,
@@ -597,6 +1039,7 @@ def main():
             graph=args.graph,
             diagnose_input=args.diagnose_input_quantization,
             diagnose_routing=args.diagnose_routing_weight_placement,
+            diagnose_term=args.diagnose_expert_term,
         )
         if args.profile_dir:
             profile_layers(

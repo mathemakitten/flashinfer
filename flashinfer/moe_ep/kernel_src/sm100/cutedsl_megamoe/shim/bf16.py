@@ -50,8 +50,27 @@ class MegaMoEBf16Config:
     gate_up_clamp: Optional[float] = None
     apply_topk_in_fc1: bool = True
     enable_iket: bool = False
+    activation: Literal["swiglu", "clamped_relu2"] = "swiglu"
+    clamped_relu2_limit: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if self.activation not in ("swiglu", "clamped_relu2"):
+            raise ValueError("unsupported BF16 activation")
+        if self.activation == "clamped_relu2":
+            if self.clamped_relu2_limit != 16.0 or self.intermediate % 256:
+                raise ValueError(
+                    "NT4 BF16 requires limit=16 and intermediate divisible by 256"
+                )
+            if (
+                self.apply_topk_in_fc1
+                or self.enable_in_kernel_fc2_reduce
+                or self.in_kernel_fc2_reduce
+            ):
+                raise ValueError("NT4 BF16 requires separate late-weighted reduction")
+            if self.gate_up_clamp is not None:
+                raise ValueError("use clamped_relu2_limit for NT4")
+        elif self.clamped_relu2_limit is not None:
+            raise ValueError("clamped_relu2_limit requires clamped_relu2")
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
             raise ValueError("rank must be in [0, world_size).")
         if self.num_tokens_per_rank <= 0:
@@ -181,6 +200,8 @@ class MegaMoEBf16Frontend:
             self._gate_up_clamp,
             c.apply_topk_in_fc1,
             c.enable_iket,
+            c.activation,
+            c.clamped_relu2_limit,
         )
 
     def _ensure_compiled(self, inputs: MegaMoEBf16Inputs) -> _CompiledMega:
@@ -192,7 +213,11 @@ class MegaMoEBf16Frontend:
         self._release_workspace()
         import cutlass
         import cutlass.cute as cute
-        from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel
+
+        if self.config.activation == "clamped_relu2":
+            from .nt4.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel
+        else:
+            from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel
 
         c = self.config
         cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
@@ -209,7 +234,11 @@ class MegaMoEBf16Frontend:
             load_balance_mode=c.load_balance_mode,
             static_expert_shape=(
                 c.num_experts_per_rank,
-                2 * c.intermediate,
+                (
+                    c.intermediate
+                    if c.activation == "clamped_relu2"
+                    else 2 * c.intermediate
+                ),
                 c.hidden,
             ),
             force_static_sched=c.force_static_sched,
@@ -226,7 +255,11 @@ class MegaMoEBf16Frontend:
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
-            gate_up_clamp=self._gate_up_clamp,
+            gate_up_clamp=(
+                c.clamped_relu2_limit
+                if c.activation == "clamped_relu2"
+                else self._gate_up_clamp
+            ),
             apply_topk_in_fc1=c.apply_topk_in_fc1,
         )
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
@@ -335,7 +368,15 @@ class MegaMoEBf16Frontend:
             (c.num_tokens_per_rank, c.hidden),
             (c.num_tokens_per_rank, c.num_topk),
             (c.num_tokens_per_rank, c.num_topk),
-            (c.num_experts_per_rank, c.hidden, 2 * c.intermediate),
+            (
+                c.num_experts_per_rank,
+                c.hidden,
+                (
+                    c.intermediate
+                    if c.activation == "clamped_relu2"
+                    else 2 * c.intermediate
+                ),
+            ),
             (c.num_experts_per_rank, c.intermediate, c.hidden),
         )
         tensors = (
@@ -430,6 +471,8 @@ def get_symm_buffer_for_bf16_mega_moe(
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
     knobs: Optional[dict] = None,
+    activation: str = "swiglu",
+    clamped_relu2_limit: Optional[float] = None,
 ) -> MegaMoEBf16SymmBuffer:
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
@@ -441,6 +484,8 @@ def get_symm_buffer_for_bf16_mega_moe(
         with_knobs,
     )
 
+    if activation == "clamped_relu2" and knobs is None:
+        knobs = {}  # Do not reuse a SwiGLU tuning result.
     if knobs is None:
         knobs, _ = resolve_knobs(
             dtype="bf16",
@@ -462,6 +507,9 @@ def get_symm_buffer_for_bf16_mega_moe(
         intermediate=intermediate,
         gate_up_clamp=clamp,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        activation=activation,
+        clamped_relu2_limit=clamped_relu2_limit,
+        apply_topk_in_fc1=activation != "clamped_relu2",
     )
     if not is_valid_bf16_for_config(cfg, knobs):
         raise ValueError(
@@ -540,7 +588,14 @@ def bf16_mega_moe(
     else:
         # Reduce straight into the result buffer
         out = y if y is not None else symm_buffer.reduced_output[:n, 0]
-        torch.sum(result, dim=1, out=out)
+        if symm_buffer._frontend.config.activation == "clamped_relu2":
+            from .nt4.reduce_bf16 import weighted_reduce
+
+            weighted_reduce(
+                result, symm_buffer.topk_idx[:n], symm_buffer.topk_weights[:n], out
+            )
+        else:
+            torch.sum(result, dim=1, out=out)
 
     if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()

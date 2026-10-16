@@ -34,7 +34,7 @@ from nt4_checkpoint_artifact import (
     validate_weights,
 )
 from nt4_checkpoint_replay import Replay, benchmark, emit, gather, profile_layers
-from nt4_token_sweep import make_sweep_sample, token_census
+from nt4_token_sweep import make_sweep_sample, token_census, sweep_points
 
 
 def revision(root, destination, prefix):
@@ -70,7 +70,7 @@ def revision(root, destination, prefix):
     return result
 
 
-def validate_layer(layer):
+def validate_layer(layer, *, expected_backend="flashinfer"):
     c = layer.config
     required = dict(
         moe_latent_size=768,
@@ -91,8 +91,11 @@ def validate_layer(layer):
             )
     if "squared_relu" not in getattr(c.activation_func, "__name__", ""):
         raise ValueError("selected layer must use squared_relu")
-    if "flashinfer" not in str(layer.experts.inference_grouped_gemm_backend).lower():
-        raise ValueError("live baseline must be FlashInfer")
+    if (
+        expected_backend
+        not in str(layer.experts.inference_grouped_gemm_backend).lower()
+    ):
+        raise ValueError(f"live baseline must use {expected_backend}")
     if layer.token_dispatcher.__class__.__name__ != "NVLSAllGatherVDispatcher":
         raise ValueError("live baseline must be NVLSAllGatherVDispatcher")
     d = layer.token_dispatcher
@@ -125,10 +128,16 @@ def export_weights(experts, rank):
 class Capture:
     def __init__(self, args):
         self.args = args
+        from nt4_capture_state import FilterStats
+
+        self.filter_stats = FilterStats()
         self.calls = 0
+        self.last_capture_call = None
+        self.step_metadata = None
         self.count = 0
         self.busy = False
         self.weights = None
+        self.runtime_hold = None
         self.weight_hashes = None
         self.sample_hashes = []
         self.results = []
@@ -185,19 +194,44 @@ class Capture:
                     )
                 self.calls += 1
                 counts = gather(x.numel() // 768, d.ep_group)
-                eligible = (
-                    self.calls > self.args.skip_calls
-                    and 0 < max(counts) <= self.args.max_local_tokens
+                from nt4_capture_state import snapshot, filter_reasons
+
+                states = gather(snapshot(), d.ep_group)
+                reasons = filter_reasons(
+                    counts,
+                    states,
+                    call=self.calls,
+                    skip_calls=self.args.skip_calls,
+                    max_local_tokens=self.args.max_local_tokens,
+                    last_capture_call=self.last_capture_call,
+                    capture_interval=self.args.capture_interval,
+                    decode_only=self.args.decode_only,
+                    min_active_tokens=self.args.min_active_tokens,
                 )
-                if not eligible and self.calls <= 8:
+                if "missing_engine_context" in reasons:
+                    raise RuntimeError(
+                        "decode-only capture requires engine context from nt4_checkpoint_generate.py"
+                    )
+                eligible = not reasons
+                improved = self.filter_stats.observe(
+                    self.calls, counts, states, reasons
+                )
+                if not eligible and (
+                    self.calls <= 8 or improved or self.calls % 32 == 0
+                ):
                     emit(
                         stage="capture_filtered",
+                        reasons=reasons,
+                        min_active_tokens=self.args.min_active_tokens,
                         call=self.calls,
                         tokens_per_rank=counts,
                         skip_calls=self.args.skip_calls,
                         max_local_tokens=self.args.max_local_tokens,
+                        engine_steps=states,
                     )
                 if eligible:
+                    self.last_capture_call = self.calls
+                    self.step_metadata = states
                     if routes.shape != (x.numel() // 768, 10):
                         raise ValueError(
                             "expected selected top-k IDs, not dense routing mask"
@@ -212,6 +246,7 @@ class Capture:
                         call=self.calls,
                         sample=self.count,
                         tokens_per_rank=counts,
+                        engine_steps=states,
                     )
             return before(x, routes, probs)
 
@@ -286,10 +321,19 @@ class Capture:
         # even if the selected layer normally relies on an earlier layer.
         d.update_metadata(x.numel() // 768)
 
+        baseline_audit = dict(
+            dispatcher=type(d).__name__,
+            expert_module=type(layer.experts).__name__,
+            weight_type=type(layer.experts._fc1_weight).__name__,
+            nvls_capacity_per_rank=d.__class__._per_rank_worst_case_token_count,
+            scope="isolated routed section; production methods, model overlap excluded",
+        )
+
         def baseline():
             h, p = before(x, routes, probs)
             h, p = d.token_dispatch(h, p)
             h, counts, p = d.dispatch_postprocess(h, p)
+            baseline_audit["expert_input_rows"] = h.shape[0]
             h, bias = apply_module(layer.experts)(
                 h, counts, p, routing_map=d.routing_map
             )
@@ -352,7 +396,22 @@ class Capture:
         self.publish(group, complete=False)
         capacity = max(gather(x.numel() // 768, group))
         if args.sweep_counts:
-            capacity = max(capacity, args.sweep_buffer_rows)
+            points = sweep_points(
+                args.sweep_counts, args.sweep_buffer_rows, args.sweep_bucket_rows
+            )
+            required = max(rows for _, rows in points)
+            available = d.__class__._per_rank_worst_case_token_count
+            if required > available:
+                raise ValueError(
+                    f"sweep needs {required} NVLS rows per rank, but allocated capacity is {available}; increase model --inference-dynamic-batching-max-tokens"
+                )
+            if args.sweep_bucket_rows is None:
+                capacity = max(capacity, args.sweep_buffer_rows)
+        if args.match_production_capacity:
+            production_capacity = d.__class__._per_rank_worst_case_token_count
+            if production_capacity < capacity:
+                raise ValueError("production capacity is smaller than captured rows")
+            capacity = production_capacity
         replay = Replay(
             self.weights,
             capacity,
@@ -360,8 +419,63 @@ class Capture:
             routing_weight_placement=args.routing_weight_placement,
             knobs=args.knobs,
         )
+        if self.runtime_hold is None:
+            # Retain the first runtime reference across samples; layer workspaces
+            # can be destroyed without finalizing/reinitializing NVSHMEM.
+            self.runtime_hold = replay.runtime
+            replay.runtime = None
         replay.check(sample, baseline, graph=args.graph)
+        hybrid = None
+        if args.three_way:
+            from nt4_nvls_hybrid import NvlsHybrid
+
+            hybrid = NvlsHybrid(replay, args.mcore_root)
+
+        def check_hybrid(point):
+            if hybrid is None:
+                return
+            if len(set(gather(replay.n, group))) != 1:
+                raise ValueError(
+                    "three-way comparison requires equal captured rows on all ranks"
+                )
+            candidate = hybrid.run().clone()
+            hybrid.check_fused_helpers()
+            compare(
+                candidate[: replay.n],
+                point["baseline"].cuda(),
+                "nvls_hybrid_vs_live_cutlass",
+            )
+            compare(candidate, replay.run(), "nvls_hybrid_vs_direct")
+            if bool((candidate[replay.n :] != 0).any()):
+                raise AssertionError("hybrid padded output must be zero")
+            torch.testing.assert_close(candidate, hybrid.run(), rtol=0, atol=0)
+            if args.graph:
+                dist.barrier(group=group)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = hybrid.run()
+                for _ in range(3):
+                    graph.replay()
+                    torch.testing.assert_close(actual, candidate, rtol=0, atol=0)
+            emit(stage="three_way_correctness", status="PASS", graph=args.graph)
+
+        check_hybrid(sample)
+        baseline_audit["candidate_buffer_rows_per_rank"] = replay.capacity
+        baseline_audit["capacity_mode"] = (
+            "match_production" if args.match_production_capacity else "capture_rows"
+        )
+        baseline_audit["candidate_padding_rows"] = replay.capacity - replay.n
+        baseline_audit["hybrid_communication_rows_per_rank"] = replay.capacity
+        emit(stage="baseline_audit", **baseline_audit)
         result = dict(
+            baseline_audit=dict(baseline_audit),
+            engine_steps=self.step_metadata,
+            workload=(
+                "real_decode_capture"
+                if args.decode_only
+                else "captured_step_unclassified"
+            ),
+            three_way=args.three_way,
             sample=self.count,
             source_call=self.calls,
             correctness="PASS",
@@ -380,34 +494,52 @@ class Capture:
                 warmup=args.warmup,
                 iterations=args.iterations,
                 rounds=args.rounds,
+                hybrid=None if hybrid is None else hybrid.run,
             )
         if args.profile_dir:
             profile_layers(
                 replay,
                 args.profile_dir / f"sample{self.count}",
                 baseline=baseline,
+                hybrid=None if hybrid is None else hybrid.run,
                 graph=args.graph,
                 iterations=args.profile_iterations,
             )
         if args.sweep_counts:
-            if args.sweep_buffer_rows > d.__class__._per_rank_worst_case_token_count:
-                raise ValueError("sweep buffer exceeds allocated NVLS capacity")
             pools = gather({key: sample[key] for key in ("x", "ids", "probs")}, group)
             pool = {key: torch.cat([part[key] for part in pools]) for key in pools[0]}
             result["sweep"] = []
             # Resampled workloads have explicit route masks, independent of the
             # engine's original token count. Each point is checked before timing.
             d.__class__._real_token_count_tensor = None
-            for active_rows in args.sweep_counts:
-                point = make_sweep_sample(
-                    pool, active_rows, args.sweep_buffer_rows, rank
-                )
+            for active_rows, buffer_rows in points:
+                if replay.capacity != buffer_rows:
+                    # Rebuild only at bucket boundaries, outside correctness and timing.
+                    if hybrid is not None:
+                        hybrid.workspace.destroy()
+                        hybrid = None
+                    previous_replay = replay
+                    replay = Replay(
+                        self.weights,
+                        buffer_rows,
+                        group,
+                        routing_weight_placement=args.routing_weight_placement,
+                        knobs=args.knobs,
+                    )
+                    # Keep one runtime reference alive across bucket changes;
+                    # NVSHMEM must not be finalized and reinitialized here.
+                    previous_replay.close()
+                    del previous_replay
+                    if args.three_way:
+                        hybrid = NvlsHybrid(replay, args.mcore_root)
+                point = make_sweep_sample(pool, active_rows, buffer_rows, rank)
                 x, routes, probs = (point[key].cuda() for key in ("x", "ids", "probs"))
-                d.update_metadata(args.sweep_buffer_rows)
+                d.update_metadata(buffer_rows)
                 point["baseline"] = baseline().detach().cpu().clone()
                 filename = f"sweep{self.count}-active{active_rows}-rank{rank}.pt"
                 hashes = save_payload(args.artifact / filename, point)
                 replay.check(point, baseline, graph=args.graph)
+                check_hybrid(point)
                 timing = benchmark(
                     replay,
                     baseline,
@@ -415,10 +547,11 @@ class Capture:
                     warmup=args.warmup,
                     iterations=args.iterations,
                     rounds=args.rounds,
+                    hybrid=None if hybrid is None else hybrid.run,
                 )
                 record = dict(
                     active_rows_per_rank=active_rows,
-                    buffer_rows=args.sweep_buffer_rows,
+                    buffer_rows=buffer_rows,
                     workload="repeated_captured_active_rows_fixed_buffers",
                     sample_file=filename,
                     sample_hashes=hashes,
@@ -432,6 +565,8 @@ class Capture:
                     save_manifest(
                         args.artifact / f"sweep{self.count}.json", result["sweep"]
                     )
+        if hybrid is not None:
+            hybrid.workspace.destroy()
         replay.close()
         d.__class__._real_token_count_tensor = source_real_tokens
         d.update_metadata(source_n)
@@ -479,7 +614,21 @@ def main():
     parser.add_argument("--samples", type=int, default=4)
     parser.add_argument("--skip-calls", type=int, default=1)
     parser.add_argument("--max-local-tokens", type=int, default=64)
+    parser.add_argument("--match-production-capacity", action="store_true")
+    parser.add_argument("--decode-only", action="store_true")
+    parser.add_argument("--min-active-tokens", type=int, default=1)
+    parser.add_argument(
+        "--capture-interval",
+        type=int,
+        default=1,
+        help="minimum layer calls between captured samples",
+    )
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument(
+        "--three-way",
+        action="store_true",
+        help="time live NVLS+CUTLASS, NVLS+MegaMoE, and direct MegaMoE together (GB300 EP4)",
+    )
     parser.add_argument(
         "--knobs-json",
         default="{}",
@@ -496,6 +645,10 @@ def main():
         help="comma-separated active rows per EP rank, e.g. 1,2,4,8,16,32,64",
     )
     parser.add_argument("--sweep-buffer-rows", type=int, default=64)
+    parser.add_argument(
+        "--sweep-bucket-rows",
+        help="comma-separated increasing padded row buckets; overrides sweep-buffer-rows",
+    )
     parser.add_argument(
         "--routing-weight-placement",
         choices=("before_quantization", "after_fc2"),
@@ -533,6 +686,8 @@ def main():
     if (
         min(
             args.samples,
+            args.min_active_tokens,
+            args.capture_interval,
             args.max_local_tokens,
             args.warmup,
             args.iterations,
@@ -545,6 +700,17 @@ def main():
         or args.layer < 0
     ):
         parser.error("counts must be positive; skip-calls must be nonnegative")
+    if args.match_production_capacity and (not args.three_way or args.sweep_counts):
+        parser.error(
+            "matched capacity requires three-way capture without synthetic sweep"
+        )
+    if args.three_way:
+        if torch.cuda.get_device_capability() != (10, 3):
+            parser.error("three-way hybrid requires GB300/SM103")
+        if args.routing_weight_placement != "after_fc2":
+            parser.error("three-way hybrid requires after_fc2 routing weights")
+        args.knobs.setdefault("group_hint", 512)
+        args.benchmark = True
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("supply -- SCRIPT.py ORIGINAL_MODEL_ARGUMENTS...")
@@ -571,15 +737,16 @@ def main():
             args.sweep_counts = [int(n) for n in args.sweep_counts.split(",")]
         except ValueError:
             parser.error("sweep-counts must be comma-separated integers")
-        if (
-            args.sweep_buffer_rows < 1
-            or min(args.sweep_counts) < 1
-            or max(args.sweep_counts) > args.sweep_buffer_rows
-            or len(set(args.sweep_counts)) != len(args.sweep_counts)
-        ):
-            parser.error(
-                "sweep counts must be unique positive counts within sweep-buffer-rows"
+        try:
+            if args.sweep_bucket_rows is not None:
+                args.sweep_bucket_rows = [
+                    int(n) for n in args.sweep_bucket_rows.split(",")
+                ]
+            sweep_points(
+                args.sweep_counts, args.sweep_buffer_rows, args.sweep_bucket_rows
             )
+        except ValueError as error:
+            parser.error(str(error))
         if args.replay_counts is not None or args.mask_odd_slots:
             parser.error(
                 "sweep cannot be combined with replay-counts or mask-odd-slots"
@@ -616,8 +783,13 @@ def main():
         source_files={},
         routing_weight_placement=args.routing_weight_placement,
         knobs=args.knobs,
+        three_way=args.three_way,
+        decode_only=args.decode_only,
+        min_active_tokens=args.min_active_tokens,
+        capture_interval=args.capture_interval,
         sweep_counts=args.sweep_counts,
         sweep_buffer_rows=args.sweep_buffer_rows,
+        sweep_bucket_rows=args.sweep_bucket_rows,
         replay_counts=args.replay_counts,
         mask_odd_slots=args.mask_odd_slots,
         workload=(
@@ -684,14 +856,24 @@ def main():
     except SystemExit as error:
         if error.code not in (None, 0):
             raise
+    summary = capture.filter_stats.report()
+    emit(stage="capture_filter_summary", **summary)
+    if dist.get_rank() == 0:
+        save_manifest(args.artifact / "capture_filter_summary.json", summary)
     if capture.count != args.samples:
         raise RuntimeError(
             f"only captured {capture.count}/{args.samples}; "
             f"observed MoE layers={sorted(capture.observed_layers, key=str)}, "
             f"selected layer={args.layer}, dispatcher calls={capture.calls}. "
-            "No observed layers means the target did not execute the hooked MoE path; "
-            "otherwise inspect capture_filtered records."
+            f"decode-only calls={summary['decode_calls']}; "
+            f"rejected_by_reason={summary['rejected_by_reason']}. "
+            "See capture_filter_summary.json for peak decode occupancy and padded rows. "
+            "No occupancy threshold was relaxed."
         )
+    if capture.runtime_hold is not None:
+        from flashinfer.moe_ep import finalize_moe_ep_runtime
+
+        finalize_moe_ep_runtime(capture.runtime_hold)
     watchdog.cancel()
     if args.trace:
         faulthandler.cancel_dump_traceback_later()

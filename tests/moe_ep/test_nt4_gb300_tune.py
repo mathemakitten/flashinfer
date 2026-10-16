@@ -12,6 +12,73 @@ spec.loader.exec_module(m)
 
 
 class TuningTest(unittest.TestCase):
+    def test_diverse_controls_and_paired_sample_report(self):
+        self.assertEqual(m.DIVERSE_SEQUENCE[0], "group512")
+        self.assertEqual(m.DIVERSE_SEQUENCE[-1], "group512")
+        for name in m.DIVERSE_SEQUENCE:
+            m.validate_knobs(m.CANDIDATES[name])
+
+        def row(name, times):
+            return dict(
+                candidate=name,
+                status="PASS",
+                artifact="a",
+                benchmarks=[
+                    dict(sample=i, megamoe=dict(median_us=t))
+                    for i, t in enumerate(times)
+                ],
+            )
+
+        records = [row("group512", [100, 200]), row("group64", [80, 220])]
+        self.assertFalse(m.diverse_report(records)["controls_complete"])
+        report = m.diverse_report(records + [row("group512", [100, 200])])
+        self.assertTrue(report["controls_complete"])
+        candidate = report["candidates"][0]
+        self.assertTrue(candidate["all_samples_measured"])
+        self.assertAlmostEqual(candidate["worst_latency_change_pct"], 10)
+        self.assertEqual(candidate["points"][0]["speedup"], 1.25)
+
+    def test_m128_bundle_survives_json_and_rejects_partial_geometry(self):
+        self.assertEqual(m.M128_SEQUENCE[0], "group1024_flag1")
+        self.assertEqual(m.M128_SEQUENCE[-1], m.M128_SEQUENCE[0])
+        for name in m.M128_SEQUENCE:
+            knobs = m.CANDIDATES[name]
+            self.assertEqual(m.validate_knobs(json.loads(json.dumps(knobs))), knobs)
+        for key in m.M128_GEOMETRY:
+            partial = dict(m.M128_GEOMETRY)
+            del partial[key]
+            with self.assertRaises(ValueError):
+                m.validate_knobs(partial)
+        with self.assertRaises(ValueError):
+            m.validate_knobs({**m.M128_GEOMETRY, "use_2cta_instrs": True})
+
+    def test_flag_interaction_control_and_report(self):
+        sequence = m.FLAG_INTERACTION_SEQUENCE
+        self.assertEqual(sequence[0], "group512_flag1")
+        self.assertEqual(sequence[-1], sequence[0])
+        for name in sequence:
+            m.validate_knobs(m.CANDIDATES[name])
+        records = [
+            dict(
+                candidate=name,
+                status="PASS",
+                artifact="a",
+                benchmarks=[dict(sample=2, megamoe=dict(median_us=time))],
+            )
+            for name, time in (
+                ("group512_flag1", 100),
+                ("group512", 110),
+                ("group1024_flag1", 90),
+                ("group512_flag1", 102),
+            )
+        ]
+        report = m.diverse_report(records, "group512_flag1")
+        self.assertTrue(report["controls_complete"])
+        self.assertEqual(report["control_candidate"], "group512_flag1")
+        self.assertEqual(report["candidates"][0]["candidate"], "group1024_flag1")
+        self.assertEqual(report["candidates"][0]["points"][0]["control_mean_us"], 101)
+        self.assertEqual(len(report["candidates"]), 2)
+
     def test_return_control_changes_only_return_mode(self):
         names = m.RETURN_CONTROL_SEQUENCE
         self.assertEqual(len(names), 3)

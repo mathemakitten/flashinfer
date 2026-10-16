@@ -21,10 +21,25 @@ from nt4_checkpoint_artifact import (
 )
 from nt4_checkpoint_replay import compare
 from nt4_checkpoint_capture import revision
-from nt4_token_sweep import make_sweep_sample, token_census
+from nt4_token_sweep import make_sweep_sample, token_census, sweep_points
 
 
 class TokenSweepTest(unittest.TestCase):
+    def test_bucket_plan(self):
+        self.assertEqual(
+            sweep_points([1, 64, 65, 256, 512], 64, [64, 128, 256, 512]),
+            [(1, 64), (64, 64), (65, 128), (256, 256), (512, 512)],
+        )
+        self.assertEqual(sweep_points([1, 32], 64), [(1, 64), (32, 64)])
+        for counts, buckets in [
+            ([513], [64, 512]),
+            ([1], [128, 64]),
+            ([1, 1], [64]),
+            ([0], [64]),
+        ]:
+            with self.assertRaises(ValueError):
+                sweep_points(counts, 64, buckets)
+
     def pool(self):
         return dict(
             x=torch.arange(3 * 768).reshape(3, 768).bfloat16(),

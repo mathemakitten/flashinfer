@@ -124,7 +124,15 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         generate_c: bool = False,
         use_stg_fc1: bool = False,
         combine_format: Optional[CombineFormat] = None,
+        skip_output_reduce: bool = False,
+        debug_prequant: bool = False,
     ) -> None:
+        if skip_output_reduce and (world_size != 1 or fc2_in_kernel_topk_reduce):
+            raise ValueError(
+                "skip_output_reduce requires local separate-contribution output"
+            )
+        self.skip_output_reduce = skip_output_reduce
+        self.debug_prequant = debug_prequant
         if static_expert_shape is None:
             raise NotImplementedError(
                 "Sm100Nt4MegaMoEMxfp8Kernel requires static_expert_shape != None "
@@ -533,6 +541,13 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
                 128,
             ),
         ]
+
+        if self.debug_prequant:
+            specs.append(
+                _RegionSpec(
+                    "debug_prequant", cutlass.Float32, (pool_token_capacity, 4), 128
+                )
+            )
 
         if self.token_back_by_dispatch:
             specs.append(
@@ -1041,7 +1056,9 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         # exits, so combine_quant and combine_sf are fully populated).  Weighting
         # follows the compute graph: apply_topk_in_fc1 folded the routing weight
         # into fc1 -> plain K-sum; otherwise topk_weights is applied here.
-        if cutlass.const_expr(not self.fc2_in_kernel_topk_reduce):
+        if cutlass.const_expr(
+            not self.fc2_in_kernel_topk_reduce and not self.skip_output_reduce
+        ):
             score = (
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1) else None
             )

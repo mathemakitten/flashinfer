@@ -112,8 +112,17 @@ def main():
             ),
             flush=True,
         )
+    from contextlib import nullcontext
+    from nt4_model_graph import defer_model_graphs
+
+    graph_setup = (
+        defer_model_graphs()
+        if os.environ.get("NT4_E2E_MODEL_GRAPHS") == "1"
+        else nullcontext()
+    )
     try:
-        engine = setup._build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
+        with graph_setup:
+            engine = setup._build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
     finally:
         inference_utils.check_flashinfer_jit_cache_installed = original_cache_check
         if is_vlm and "original_loader" in locals():
@@ -132,15 +141,33 @@ def main():
         top_n_logprobs=args.top_n_logprobs,
         stop_words=args.stop_words,
     )
+    if os.environ.get("NT4_E2E_MODE"):
+        from nt4_e2e_adapter import run
+
+        run(engine, args, tokenizer, sampling, build_requests, run_inference)
+        return
     requests = build_requests(args, tokenizer, sampling)
     print(
         json.dumps(
-            dict(stage="generation_start", requests=len(requests), is_vlm=is_vlm)
+            dict(
+                stage="generation_start",
+                requests=len(requests),
+                is_vlm=is_vlm,
+                termination_id=sampling.termination_id,
+                ignore_eos=sampling.termination_id < 0,
+                num_tokens_to_generate=args.num_tokens_to_generate,
+            )
         ),
         flush=True,
     )
     engine.reset()
-    result = run_inference(requests, engine)
+    from nt4_capture_state import set_context
+
+    set_context(engine.context)
+    try:
+        result = run_inference(requests, engine)
+    finally:
+        set_context(None)
     torch.cuda.synchronize()
     print(
         json.dumps(

@@ -43,3 +43,27 @@ frontend defaults, not a measured optimum.
 
 Run instructions and remaining integration gates are in
 [the GB300 bring-up guide](../../../../../../../examples/moe_ep/nt4_megamoe_bringup.md).
+
+## BF16 NT4 variant (GPU validation pending)
+
+The owned `megamoe_kernel_bf16.py` and `kernel_bf16_glu_fc12.py` adapt
+`src/moe_bf16_glu` without editing vendor files. FC1 and FC2 both use width I;
+FC1 has no gate/up interleave. `epilogue_bf16.py` inherits the existing owned
+NT4 non-gated activation/layout and disables scale-factor state and overlapping
+accumulation. Four shared-memory stages hold complete per-warp output tiles.
+FC1's FP32 activation is rounded to BF16 for FC2; each FC2 term is rounded to
+BF16 before the separate FP32 late-weighted reduction. No MXFP8 quantization
+is used. Raw-C generation and alternative reduction modes are not exposed.
+
+Select `activation="clamped_relu2", clamped_relu2_limit=16.0, knobs={}` on
+`Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig`. The original SwiGLU default is
+unchanged. BF16 retains its validated upstream geometry (256,256,64), cluster
+(2,1,1); MXFP8's M128 tuning is not assumed valid. Activation and clamp are in
+compile/workspace keys. The separate reducer masks invalid expert slots.
+
+Run `torchrun --standalone --nproc-per-node=4 examples/moe_ep/nt4_bf16_bringup.py`
+first (the E2E sweep does this automatically). CPU tests do not qualify this
+prototype for performance or numerical claims. The BF16 reference gate is
+provisional: per-contribution relative L2 <= 1% plus 1e-5 absolute L2 allowance,
+existing overall/per-row L2 gate, exact recombination and poisoned repeat, and
+live-baseline comparison. No thresholds are relaxed on failure.

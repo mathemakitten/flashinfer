@@ -180,6 +180,9 @@ class GluMxfp8Epilogue:
         combine_format: Optional[Any] = None,
     ) -> None:
         self.fc1_output_dtype = fc1_output_dtype
+        self._debug_prequant_offset = None
+        self._debug_prequant_width = 0
+        self._debug_prequant_rows = 0
         self.fc1_output_layout = fc1_output_layout
         self.acc_dtype = acc_dtype
         self.sf_dtype = sf_dtype
@@ -551,6 +554,7 @@ class GluMxfp8Epilogue:
         tma_atom_c: cute.CopyAtom,
         gmem_c: cute.Tensor,
         c_pipeline,
+        debug_prequant_base: cutlass.Int64,
     ) -> None:
         """MXFP8 fc1 task-tile: TmemTranspose16x32 TMEM loading + cross-warp E8M0 exchange."""
         real_fc1_output, _ = sched_ext.get_gmem_tensor(
@@ -657,6 +661,7 @@ class GluMxfp8Epilogue:
                 gmem_c_subtile_view=gmem_c_subtile_arg,
                 c_buffer_idx=c_buffer_idx,
                 c_pipeline=c_pipeline,
+                debug_prequant_base=debug_prequant_base,
             )
 
             tmem_gate, tmem_up = self._subtile_forward_tmem_tensor(
@@ -741,6 +746,7 @@ class GluMxfp8Epilogue:
         gmem_c_subtile_view: cute.Tensor,
         c_buffer_idx,
         c_pipeline,
+        debug_prequant_base: cutlass.Int64,
     ) -> None:
         """MXFP8 fc1 subtile: GLU + E8M0 SF + fp8 R2S."""
         iket.range_push("fc1_epilogue_subtile")
@@ -787,6 +793,40 @@ class GluMxfp8Epilogue:
 
         swiglu = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
         self._swiglu_act(swiglu, r_up, r_gate, topk)
+
+        # Debug-only capture of actual accumulator and activation registers for
+        # channels 970 and 1463. Uses a separate local region, never FC2 operands.
+        if cutlass.const_expr(self._debug_prequant_offset is not None):
+            local_token = (
+                cutlass.Int32(warp_idx * EpilogueTileN) + tidx % WarpThreadCount
+            )
+            if local_token < work_tile_info.valid_tokens_in_cta_tile:
+                expert_start = work_tile_info.cumulative_data_physical_row
+                pool_row = (
+                    expert_start
+                    + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
+                    + local_token
+                )
+                debug = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Float32,
+                        debug_prequant_base,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((self._debug_prequant_rows, 4), stride=(4, 1)),
+                )
+                col = (
+                    work_tile_info.tile_n_idx * cutlass.Int32(self._subtile_cnt)
+                    + subtile_idx
+                ) * cutlass.Int32(Fc1GateUpInterleave)
+                for i in cutlass.range_constexpr(Fc1GateUpInterleave):
+                    if col + i == 970:
+                        debug[pool_row, 0] = r_gate[i]
+                        debug[pool_row, 1] = swiglu[i]
+                    if col + i == 1463:
+                        debug[pool_row, 2] = r_gate[i]
+                        debug[pool_row, 3] = swiglu[i]
 
         c = cute.make_rmem_tensor(r_layout.shape, self.fc1_output_dtype)
         if cutlass.const_expr(self.fc1_output_dtype.width == 8):
@@ -1435,6 +1475,14 @@ class GluMxfp8Epilogue:
                     _smem_c_buf = smem_fc1_output_buffer
                     _tma_atom_c = tma_atom_fc1_output
                     _gmem_c = gmem_fc1_output
+                debug_prequant_base = cutlass.Int64(0)
+                if cutlass.const_expr(self._debug_prequant_offset is not None):
+                    # local_zero_prefix is a typed pointer at local_workspace+0.
+                    # gmem_fc1_output may instead be a TMA coordinate tensor.
+                    debug_prequant_base = (
+                        token_comm_args.local_zero_prefix.iterator.toint()
+                        + cutlass.Int64(self._debug_prequant_offset)
+                    )
                 self._run_fc1_task_tile(
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_stage_tesnor,
@@ -1455,6 +1503,7 @@ class GluMxfp8Epilogue:
                     tma_atom_c=_tma_atom_c,
                     gmem_c=_gmem_c,
                     c_pipeline=_c_pipeline,
+                    debug_prequant_base=debug_prequant_base,
                 )
             else:
                 self._run_fc2_task_tile(

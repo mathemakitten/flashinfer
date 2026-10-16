@@ -27,6 +27,22 @@ def token_census(sample):
     )
 
 
+def sweep_points(counts, buffer_rows, buckets=None):
+    """Map active counts to the smallest declared buffer bucket that fits."""
+    sizes = [buffer_rows] if buckets is None else buckets
+    if not sizes or any(n < 1 for n in sizes) or sizes != sorted(set(sizes)):
+        raise ValueError("sweep buckets must be unique, positive, and increasing")
+    if (
+        not counts
+        or len(set(counts)) != len(counts)
+        or any(n < 1 or n > sizes[-1] for n in counts)
+    ):
+        raise ValueError(
+            "sweep counts must be unique positive counts within the largest buffer bucket"
+        )
+    return [(n, next(b for b in sizes if b >= n)) for n in counts]
+
+
 def make_sweep_sample(pool, active_rows, buffer_rows, rank):
     """Repeat valid captured rows; do not fabricate routes for padding rows."""
     if not 0 <= active_rows <= buffer_rows:
