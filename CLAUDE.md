@@ -53,6 +53,30 @@ derive their interpreter and site-packages paths from that file. When raising
 the minimum, also update `project.requires-python` and `tool.mypy.python_version`
 in `pyproject.toml`.
 
+### NT4 MXFP8 shortcut overlap experiment
+
+For the unclamped TRTLLM surrogate diagnostic, see
+`examples/moe_ep/nt4_trtllm_surrogate.txt`. All arms use native clamped continuation
+after the timed branch join; these timings are not E2E throughput evidence.
+
+`examples/moe_ep/nt4_mxfp8_overlap.sh` runs staged-expert correctness tests followed
+by CUTLASS + NVLS / MegaMoE / CUTLASS + NVLS checkpoint runs. It requires the synced
+MCore native FlashInfer shortcut stages. All arms use FlashInfer MXFP8 prefill and
+full decode graphs; the vLLM-specific expert CTA cap is explicitly zero.
+See `examples/moe_ep/nt4_mxfp8_overlap.txt` for scope and GPU validation requirements.
+For saved-route CUTLASS MXFP8 tactic sweeps, see
+`examples/moe_ep/nt4_cutlass_decode_tune.txt` (no model load; E2E confirmation required).
+Use `nt4_e2e.py --cutlass-decode-profile-ids FC1 FC2` for a bracketed MXFP8
+shortcut-overlap confirmation; the instance-local adapter preserves prefill tactics.
+For the MXFP8 152/144/136-worker mixer-tail experiment against tuned CUTLASS,
+see `examples/moe_ep/nt4_mxfp8_worker_sweep.txt`. No library default changes.
+For the three-way MXFP8 hybrid/direct/tuned-CUTLASS comparison, see
+`examples/moe_ep/nt4_mxfp8_hybrid_sweep.txt`.
+For the independent 0/1/2-stage shared-memory pipeline experiment, see
+`examples/moe_ep/nt4_mxfp8_pipeline_sweep.txt`; worker count stays at 152.
+For matched-input serial/overlap branch timing, run `nt4_branch_backend.sh` with
+`NT4_BRANCH_PRECISION=mxfp8`; see `examples/moe_ep/nt4_branch_backend.txt`.
+
 ## Quick Start for Development
 
 ### Installation

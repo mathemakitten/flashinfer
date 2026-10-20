@@ -83,6 +83,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         force_static_sched: bool = True,
         clc_bundle_size: Optional[int] = None,
         num_sched_stages: Optional[int] = None,
+        ab_stage_reduction: int = 0,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         sf_vec_size: int = 32,
         ab_dtype: Type[cutlass.Numeric] = cutlass.Float4E2M1FN,
@@ -159,6 +160,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         self.static_expert_shape = static_expert_shape
         self.clc_bundle_size = clc_bundle_size
         self.num_sched_stages = num_sched_stages
+        self.ab_stage_reduction = ab_stage_reduction
 
         # Fused fc12 sched-side knobs
         self.group_hint = group_hint
@@ -585,6 +587,36 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             num_b_stage = num_b_stage + 1
             unused_smem = unused_smem - b_bytes_per_stage
 
+        from .pipeline_config import reduce_ab_stages
+        import json
+
+        original_a, original_b = num_a_stage, num_b_stage
+        num_a_stage, num_b_stage = reduce_ab_stages(
+            original_a, original_b, self.ab_stage_reduction
+        )
+        released = self.ab_stage_reduction * ab_bytes_per_stage
+        print(
+            json.dumps(
+                dict(
+                    stage="nt4_mxfp8_pipeline_resources",
+                    mma_tiler_mnk=mma_tiler_mnk,
+                    reduction=self.ab_stage_reduction,
+                    original_a_stages=original_a,
+                    original_b_stages=original_b,
+                    a_stages=num_a_stage,
+                    b_stages=num_b_stage,
+                    accumulator_stages=num_acc_stage,
+                    scheduler_stages=num_sched_stages,
+                    threads_per_cta=self.threads_per_cta,
+                    tmem_alloc_cols=self.num_tmem_alloc_cols,
+                    ab_bytes_per_stage=ab_bytes_per_stage,
+                    released_ab_smem_bytes=released,
+                    estimated_smem_bytes=smem_per_cta - unused_smem - released,
+                    note="layout-budget estimate; does not measure registers or achieved occupancy",
+                )
+            ),
+            flush=True,
+        )
         return num_acc_stage, num_a_stage, num_b_stage, num_sched_stages
 
     def get_workspace_size_in_bytes(

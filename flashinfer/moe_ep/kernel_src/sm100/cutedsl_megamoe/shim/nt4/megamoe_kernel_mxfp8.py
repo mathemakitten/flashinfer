@@ -126,6 +126,7 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         combine_format: Optional[CombineFormat] = None,
         skip_output_reduce: bool = False,
         debug_prequant: bool = False,
+        ab_stage_reduction: int = 0,
     ) -> None:
         if skip_output_reduce and (world_size != 1 or fc2_in_kernel_topk_reduce):
             raise ValueError(
@@ -170,6 +171,7 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
             raise ValueError(f"unsupported token_back_mode={token_back_mode!r}.")
 
         super().__init__(
+            ab_stage_reduction=ab_stage_reduction,
             mma_tiler_mnk=mma_tiler_mnk,
             cluster_shape_mnk=cluster_shape_mnk,
             use_2cta_instrs=use_2cta_instrs,

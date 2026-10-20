@@ -63,6 +63,8 @@ class MegaMoEMxfp8Config:
     use_2cta_instrs: bool = True
     load_balance_mode: Literal["static", "atomic_counter"] = "static"
     group_hint: Optional[int] = None
+    max_active_clusters: Optional[int] = None
+    ab_stage_reduction: int = 0
     force_static_sched: bool = True
     clc_bundle_size: Optional[int] = None
     num_sched_stages: Optional[int] = None
@@ -83,6 +85,20 @@ class MegaMoEMxfp8Config:
     )
 
     def __post_init__(self) -> None:
+        if type(self.ab_stage_reduction) is not int or self.ab_stage_reduction not in (
+            0,
+            1,
+            2,
+        ):
+            raise ValueError("ab_stage_reduction must be 0, 1 or 2")
+        if self.ab_stage_reduction and self.activation != "clamped_relu2":
+            raise ValueError("AB stage reduction is qualified only for NT4")
+        if self.max_active_clusters is not None and (
+            type(self.max_active_clusters) is not int or self.max_active_clusters < 1
+        ):
+            raise ValueError("max_active_clusters must be a positive integer or None")
+        if self.max_active_clusters is not None and self.activation != "clamped_relu2":
+            raise ValueError("worker cap is experimental and qualified only for NT4")
         if self.return_contributions_only and (
             not self.local_only
             or self.activation != "clamped_relu2"
@@ -415,6 +431,8 @@ class MegaMoEMxfp8Frontend:
             c.use_2cta_instrs,
             c.load_balance_mode,
             c.group_hint,
+            c.max_active_clusters,
+            c.ab_stage_reduction,
             c.force_static_sched,
             c.clc_bundle_size,
             c.num_sched_stages,
@@ -457,7 +475,30 @@ class MegaMoEMxfp8Frontend:
         sm_count = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
-        max_active_clusters = max(1, sm_count // max(cluster_size, 1))
+        physical_clusters = max(1, sm_count // max(cluster_size, 1))
+        max_active_clusters = c.max_active_clusters or physical_clusters
+        if max_active_clusters > physical_clusters:
+            raise ValueError(
+                f"worker cap {max_active_clusters} exceeds device limit {physical_clusters}"
+            )
+        if c.max_active_clusters is not None:
+            import json
+
+            print(
+                json.dumps(
+                    dict(
+                        stage="mxfp8_worker_launch",
+                        rank=c.rank,
+                        physical_sm_count=sm_count,
+                        cluster_size=cluster_size,
+                        max_active_clusters=max_active_clusters,
+                        worker_ctas=max_active_clusters * cluster_size,
+                        group_hint=c.group_hint,
+                        mma_tiler_mnk=c.mma_tiler_mnk,
+                    )
+                ),
+                flush=True,
+            )
         group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
 
         kernel_type = Sm100MegaMoEMxfp8Kernel
@@ -466,6 +507,7 @@ class MegaMoEMxfp8Frontend:
             from .nt4.megamoe_kernel_mxfp8 import Sm100Nt4MegaMoEMxfp8Kernel
 
             kernel_type = Sm100Nt4MegaMoEMxfp8Kernel
+            nt4_kwargs["ab_stage_reduction"] = c.ab_stage_reduction
             nt4_kwargs["skip_output_reduce"] = c.return_contributions_only
             nt4_kwargs["debug_prequant"] = os.environ.get("NT4_DEBUG_PREQUANT") == "1"
         kernel = kernel_type(

@@ -37,6 +37,8 @@ class MegaMoEBf16Config:
     use_2cta_instrs: bool = True
     load_balance_mode: Literal["static", "atomic_counter"] = "static"
     group_hint: Optional[int] = None
+    # Explicit persistent cluster count; None preserves the full-device launch.
+    max_active_clusters: Optional[int] = None
     force_static_sched: bool = True
     clc_bundle_size: Optional[int] = None
     num_sched_stages: Optional[int] = None
@@ -54,6 +56,10 @@ class MegaMoEBf16Config:
     clamped_relu2_limit: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if self.max_active_clusters is not None and (
+            type(self.max_active_clusters) is not int or self.max_active_clusters < 1
+        ):
+            raise ValueError("max_active_clusters must be a positive integer or None")
         if self.activation not in ("swiglu", "clamped_relu2"):
             raise ValueError("unsupported BF16 activation")
         if self.activation == "clamped_relu2":
@@ -190,6 +196,7 @@ class MegaMoEBf16Frontend:
             c.cluster_shape_mnk,
             c.load_balance_mode,
             c.group_hint,
+            c.max_active_clusters,
             c.force_static_sched,
             c.clc_bundle_size,
             c.num_sched_stages,
@@ -224,12 +231,24 @@ class MegaMoEBf16Frontend:
         sm_count = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
-        max_active_clusters = max(1, sm_count // cluster_size)
+        physical_clusters = max(1, sm_count // cluster_size)
+        max_active_clusters = c.max_active_clusters or physical_clusters
+        if max_active_clusters > physical_clusters:
+            raise ValueError(
+                f"requested {max_active_clusters} worker clusters exceeds "
+                f"device limit {physical_clusters}"
+            )
+        self.launch_audit = dict(
+            physical_sm_count=sm_count,
+            cluster_size=cluster_size,
+            max_active_clusters=max_active_clusters,
+            worker_ctas=max_active_clusters * cluster_size,
+        )
         kernel = Sm100MegaMoEBf16Kernel(
             mma_tiler_mnk=c.mma_tiler_mnk,
             cluster_shape_mnk=c.cluster_shape_mnk,
             use_2cta_instrs=c.use_2cta_instrs,
-            group_hint=c.group_hint or max_active_clusters,
+            group_hint=c.group_hint or physical_clusters,
             token_padding_block=128,
             load_balance_mode=c.load_balance_mode,
             static_expert_shape=(
