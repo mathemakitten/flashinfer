@@ -1,0 +1,107 @@
+NT4 inference GC reproduction
+============================
+Purpose: identify Python collection pauses during request admission/generation,
+then compare with full collection moved before the timed generation window.
+This is a diagnostic, not a production GC fix or a clean-main reproducer.
+
+Configuration: 4 GB300 GPUs, EP4, BF16 vLLM grouped GEMM + NVLS,
+shortcut overlap, whole-model decode graphs, 128 requests, 128 output tokens,
+2048-token model budget. Prefill/request admission remain outside decode graphs.
+Each arm runs two fresh processes, each with eager verification, graph warmup,
+and three measured rounds. Normal automatic GC runs first, controlled GC second.
+This order is adequate for finding pauses, not a drift-controlled throughput claim.
+
+Use the same working container as the NT4 experiments (Python 3.12, CUDA 13.3,
+PyTorch nv26.07 and its TE/FlashAttention dependencies). Do not upgrade its stack.
+The checkpoint and tokenizer paths are read from the source manifest; retain
+access to both. Share the source artifact's manifest.json and prompt JSONL.
+Saved activation tensors are not required by this E2E launcher.
+FlashInfer submodules must be populated. Matching JIT-cache/NVSHMEM dependencies
+must be installed in the container. The cache itself is optional acceleration;
+sharing a cache does not replace sharing source and pinned package versions.
+
+Run (on a four-GPU allocation, not the login node):
+
+export PY="$(command -v python3)"
+export FLASHINFER_CHECKOUT=/lustre/fsw/portfolios/nemotron/users/helenn/flashinfer-nt4-gb300-nvls
+export MCORE_CHECKOUT=/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/helenn/megatron-lm
+export NT4_LOG_DIR=/lustre/fsw/portfolios/nemotron/users/helenn/logs
+export FLASHINFER_WORKSPACE_BASE=/lustre/fsw/portfolios/nemotron/users/helenn
+export MAX_JOBS=4
+export GC_REPRO_OUTPUT="$NT4_LOG_DIR/nt4-gc-repro-$(date +%Y%m%d-%H%M%S)"
+
+"$PY" "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_gc_repro.py" \
+  --mcore-root "$MCORE_CHECKOUT" \
+  --source-artifact "$NT4_LOG_DIR/nt4-checkpoint-layer-20261012-080901" \
+  --prompt-file /lustre/fsw/portfolios/nemotron/users/helenn/research/routing/openmath2_unique2048.jsonl \
+  --output "$GC_REPRO_OUTPUT"
+
+Add --dry-run to validate paths and print both commands without launching GPUs.
+The launcher clears inherited NT4 experiment settings in its children and disables
+periodic GPU telemetry writes. It does not use Nsight or poll the filesystem.
+It fails on an existing output directory or any failed child run.
+
+Send back the output directory, including:
+- provenance.json and packages.txt
+- automatic/summary.json and controlled/summary.json
+- each arm's audit-inputs.json and per-process audit-metadata-rank*.json
+- audit-round*-rank*.json from ALL ranks (not just rank 0)
+- automatic.log, controlled.log, and child process logs
+
+Interpretation:
+In audit-round*-rank*.json, inspect gc_spans and first_forward_host_spans.
+Each span contains start/end wall_ns and thread_cpu_ns. Match GC intervals to
+engine.add_request / engine._add_request and generation_to_first_forward spans.
+Do not sum nested host spans. Compare all ranks for admission skew. Focus on
+measured rounds 1..3. The logged e2e_result.gc_policy.collection_seconds is the
+cost of collection moved before timing in the controlled arm. Include that cost
+when discussing overall service cost. Controlled GC should suppress automatic
+collections during measured generation; explicit gc.collect calls can still run.
+No pause in one run is inconclusive: GC is allocation-history dependent. This
+experiment does not prove request admission owns the objects being collected.
+
+Source handoff / commits
+========================
+At preparation time:
+FlashInfer directory is on helenn-nt4-trtllm-clamped-integration, HEAD b7626c0f8.
+helenn-nt4-gb300-nvls points to the same HEAD, but most harness files are UNTRACKED.
+MCore is on helenn-nt4-megamoe-shortcut-integration, HEAD c9ff56d2a1.
+Branch names alone are insufficient; record final committed SHA pairs.
+
+The file nt4_gc_repro_files.txt enumerates the Python harness dependency closure
+(including lazy imports) plus these reproduction files. This is conservative;
+it does not enable the unrelated MegaMoE/TRTLLM experiments. It excludes dirty
+TRTLLM CUDA/C++ changes and the unrelated CLAUDE.md changes.
+
+To publish on the requested FlashInfer branch, after reviewing your working tree:
+  cd /Users/helenn/Documents/github/flashinfer-nt4-gb300-nvls
+  git switch helenn-nt4-gb300-nvls
+  git add --pathspec-from-file=examples/moe_ep/nt4_gc_repro_files.txt
+  git diff --cached --stat
+  git diff --cached --check
+  git commit -m "Add NT4 end-to-end inference GC reproduction harness"
+
+Review any files already staged before committing; this does not unstage them.
+The checkpoint_generate.py change includes an opt-in TE workspace diagnostic;
+it is disabled by this launcher. No TRTLLM export or kernel rebuild is required
+specifically for this BF16 vLLM GC comparison.
+
+MCore has no new GC policy patch for this reproduction. Share the integration
+branch, not the separate megatron-lm-request-gc worktree. Its outstanding router
+shape fix is a separate change; to preserve the current tested integration state:
+  cd /Users/helenn/Documents/github/megatron-lm
+  git add megatron/core/transformer/moe/router.py \
+    tests/unit_tests/determinism/kernels/manifest.py \
+    tests/unit_tests/determinism/kernels/test_inference_router_shapes.py
+  git diff --cached --stat
+  git diff --cached --check
+  git commit -m "Keep inference router compilation dynamic across token shapes"
+
+Push the two selected branches through your normal workflow and give the teammate
+both final SHAs, the container identity, manifest, prompt file and accessible
+checkpoint/tokenizer paths. Do not commit weights, caches or downloaded logs.
+
+Validation of this packaging: local Python syntax, dependency-closure check and
+synthetic-manifest dry run. The wrapper itself still needs its first GPU run.
+The underlying automatic/controlled GC experiment was run previously; this does
+not assert that the current entire integration branch has been GPU revalidated.
