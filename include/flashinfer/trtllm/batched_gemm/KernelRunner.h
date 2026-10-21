@@ -80,6 +80,10 @@ enum class EltwiseActType {
   // act = relu(x0) ^ 2
   // where x0 is the output of the Gemm.
   Relu2,
+#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
+  // Use the exported enum value: Silu occupies the preceding generator slot.
+  ClampedRelu2 = static_cast<int>(batchedGemm::gemm::EltwiseActType::ClampedRelu2),
+#endif
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions {

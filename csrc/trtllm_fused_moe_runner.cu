@@ -131,6 +131,10 @@ static inline EltwiseActType activationTypeToEltwiseActType(ActivationType actTy
   switch (actType) {
     case ActivationType::Relu2:
       return EltwiseActType::Relu2;
+#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
+    case ActivationType::ClampedRelu2:
+      return EltwiseActType::ClampedRelu2;
+#endif
     case ActivationType::Identity:
       return EltwiseActType::None;
     default:
@@ -147,9 +151,13 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     batchedGemm::gemm::MatrixLayout weightLayout, batchedGemm::gemm::BiasType biasType,
     bool usePerTokenScaling, bool usePerChannelScaling) {
   int64_t actTypeInt = static_cast<int64_t>(activationType);
-  FLASHINFER_CHECK(
-      0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
-      "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
+  bool knownActivation =
+      0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType);
+#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
+  knownActivation = knownActivation || activationType == ActivationType::ClampedRelu2;
+#endif
+  FLASHINFER_CHECK(knownActivation, "Unknown activation type",
+                   serializeActivationType(activationType), "of enum", actTypeInt);
   bool isGatedAct = isGatedActivation(activationType);
   bool useBiasMn = biasType == batchedGemm::gemm::BiasType::Mn;
   // ReorderAndShuffle is only supported on fused-act (gated) paths in trtllm-gen.

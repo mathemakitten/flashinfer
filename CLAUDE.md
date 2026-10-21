@@ -53,7 +53,45 @@ derive their interpreter and site-packages paths from that file. When raising
 the minimum, also update `project.requires-python` and `tool.mypy.python_version`
 in `pyproject.toml`.
 
+### NT4 TRTLLM-gen activation integration
+
+See `examples/moe_ep/nt4_trtllm_clamped.txt` for the opt-in local artifact path
+(`FLASHINFER_TRTLLM_NT4_EXPORT`) and EP4 validation command. It uses its own JIT
+identity and matching exported headers; never mix those with shipped descriptors.
+ClampedRelu2 is MXFP8-only; advertised tiles come from the exported FC1/FC2
+intersection. The sweep export offers tiles 16/32/64/128. The existing
+unclamped surrogate remains a separate diagnostic.
+
 ### NT4 MXFP8 shortcut overlap experiment
+
+`examples/moe_ep/nt4_router_fixed_sweep.sh` reuses the existing clamped TRTLLM
+export for a 32/128/256/512-request MXFP8 comparison (512 generated tokens,
+two measured rounds, full-model graphs and shortcut overlap). It requires the
+MCore router's `torch.compile(dynamic=True)` fix, runs its shape-transition
+regression first, and stops on failure. Each point brackets MegaMoE hybrid and
+TRTLLM ClampedRelu2 with tuned CUTLASS controls. The new sweep is not yet GPU
+validated; the dynamic-router CUTLASS baseline passed eager/graph exact equality
+at 128 requests and 64 generated tokens. Hybrid correctness remains unconfirmed.
+
+`examples/moe_ep/nt4_hybrid_graph_repro.py` isolates hybrid graph lifetimes using
+one saved layer artifact (no full checkpoint). It builds 32/16/2/1-row buckets,
+resets validation graphs, and checks exact replay with changed routes after all
+buckets exist. Run under EP4 torchrun; `--shared-pool` exercises a shared capture
+pool. This diagnostic is not yet GPU validated and does not establish full-model
+correctness. Use an external timeout when investigating device hangs.
+
+`NT4_TE_STREAM_WORKSPACES=1` enables a process-local, stream-keyed TE GEMM
+scratch allocator in `nt4_checkpoint_generate.py` for overlap debugging. It
+does not modify the installed package. `te_stream_workspace_usage` reports
+whether TE GEMMs exercised it; zero calls rejects this hypothesis for that run.
+This candidate repair still requires full-model eager/graph correctness gates;
+it is not a validated fix for the October 20 failures.
+
+`NT4_NATIVE_CUTLASS_SERIAL_AUDIT=1` preserves MCore's native serial MXFP8
+CUTLASS + NVLS path in the graph adapter, including decode tactic overrides.
+Both `NT4_SHORTCUT_OVERLAP` and MCore overlap must be disabled. This diagnostic
+observes expert graph capture without substituting the standalone replay path;
+the full-model eager/graph equality gate remains mandatory.
 
 For the unclamped TRTLLM surrogate diagnostic, see
 `examples/moe_ep/nt4_trtllm_surrogate.txt`. All arms use native clamped continuation

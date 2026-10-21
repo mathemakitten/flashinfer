@@ -22,6 +22,13 @@ def vlm_language_impl(args):
 
 
 def main():
+    if os.environ.get("NT4_TE_STREAM_WORKSPACES") == "1":
+        import atexit
+        from nt4_te_workspace import install, emit_report
+
+        workspaces = install()
+        atexit.register(emit_report, workspaces)
+
     import megatron.training
 
     root = Path(megatron.training.__file__).resolve().parents[2]

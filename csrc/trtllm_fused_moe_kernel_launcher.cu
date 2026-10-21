@@ -11,6 +11,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
+#include "nt4_trtllm_tiles.h"
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <flashinfer/exception.h>
@@ -998,6 +1002,11 @@ inline std::string fp8QuantizationTypeToString(Fp8QuantizationType quantization_
 }
 
 inline ActivationType validateAndCastActivationType(int64_t act_type) {
+#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
+  if (act_type == static_cast<int64_t>(ActivationType::ClampedRelu2)) {
+    return ActivationType::ClampedRelu2;
+  }
+#endif
   TVM_FFI_ICHECK(act_type >= 0 && act_type < static_cast<int64_t>(ActivationType::InvalidType))
       << "Invalid activation type: " << act_type;
   return static_cast<ActivationType>(act_type);
@@ -1017,6 +1026,15 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
     Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
     Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
     ActivationType activation_type) {
+  if (activation_type == ActivationType::ClampedRelu2) {
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
+        << "ClampedRelu2 requires MXFP8.";
+    TVM_FFI_ICHECK(gemm1_clamp_limit.has_value())
+        << "ClampedRelu2 requires gemm1_clamp_limit.";
+    TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
+        << "ClampedRelu2 does not accept SwiGLU alpha/beta.";
+    return;
+  }
   if (!hasOptionalGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit)) {
     return;
   }
@@ -1469,6 +1487,10 @@ class FusedMoeLauncher {
   }
 
   void check_moe_common(bool allow_bias_with_none_type = false) const {
+    if (activation_type == ActivationType::ClampedRelu2) {
+      TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::MxE4m3 && !args->mUseDeepSeekFp8)
+          << "Experimental ClampedRelu2 requires MXFP8.";
+    }
     // Hidden states [num_tokens, hidden_size]
     TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
     check_gemm1_bias_mn(gemm1_bias, gemm1_bias_type, args->num_tokens, args->top_k,
@@ -3919,7 +3941,12 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
  public:
   static constexpr std::array<int32_t, 5> mBaseSupportedTileNums = {8, 16, 32, 64, 128};
 
-  static std::vector<int32_t> getSupportedTileNums(Fp8QuantizationType quantization_type) {
+  static std::vector<int32_t> getSupportedTileNums(
+      Fp8QuantizationType quantization_type, ActivationType activation_type) {
+#ifdef FLASHINFER_TRTLLM_CLAMPED_RELU2
+    // Advertise only token tiles present in both local FC1 and FC2 exports.
+    if (activation_type == ActivationType::ClampedRelu2) return {FLASHINFER_TRTLLM_NT4_TILES};
+#endif
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (quantization_type == Fp8QuantizationType::MxFp8) {
       tiles.push_back(256);
@@ -4460,7 +4487,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
     auto activation_type = validateAndCastActivationType(act_type);
 
-    auto supported_tile_nums = getSupportedTileNums(quantization_type);
+    auto supported_tile_nums = getSupportedTileNums(quantization_type, activation_type);
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
@@ -5673,7 +5700,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   int64_t const totalExpertsPerToken = top_k + nFusedShared;
   int64_t const totalLocalExperts = local_num_experts + nFusedShared;
 
-  auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
+  auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type, activation_type);
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size

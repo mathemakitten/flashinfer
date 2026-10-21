@@ -174,8 +174,8 @@ enum class ActivationType : int64_t {
   Identity = 9,
   Situ = 10,
   InvalidType = 11,  // Must be last among the normally-sequential members
-  // CUTLASS-backend only. Keep this after InvalidType so the existing values
-  // consumed by the TRT-LLM backend remain stable.
+  // Keep the existing ABI value. Experimental TRTLLM-gen exports also support
+  // this activation explicitly; InvalidType remains a rejected sentinel.
   ClampedRelu2 = 12,
 };
 
