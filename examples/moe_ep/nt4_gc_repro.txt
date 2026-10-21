@@ -39,6 +39,8 @@ export GC_REPRO_OUTPUT="$NT4_LOG_DIR/nt4-gc-repro-$(date +%Y%m%d-%H%M%S)"
 Add --dry-run to validate paths and print both commands without launching GPUs.
 The launcher clears inherited NT4 experiment settings in its children and disables
 periodic GPU telemetry writes. It does not use Nsight or poll the filesystem.
+Git and .git directories are optional on the execution node. Unavailable Git
+metadata is recorded in provenance.json without stopping the experiment.
 It fails on an existing output directory or any failed child run.
 
 Send back the output directory, including:

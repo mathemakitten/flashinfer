@@ -7,6 +7,24 @@ import subprocess
 import sys
 
 
+def source_metadata(checkout):
+    """Best-effort provenance; synced directories need neither Git nor .git."""
+    result = {"path": str(checkout.resolve()), "head": None, "status": None}
+    try:
+        for key, command in (
+            ("head", ["rev-parse", "HEAD"]),
+            ("status", ["status", "--porcelain", "--untracked-files=no"]),
+        ):
+            process = subprocess.run(
+                ["git", "-C", str(checkout), *command],
+                capture_output=True, text=True, timeout=10, check=True,
+            )
+            result[key] = process.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        result["git_metadata_unavailable"] = type(exc).__name__
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--mcore-root", type=Path, required=True)
@@ -55,10 +73,7 @@ def main():
     args.output.mkdir(parents=True)
     versions = {}
     for name, checkout in (("flashinfer", root), ("mcore", args.mcore_root)):
-        versions[name] = {
-            "head": subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip(),
-            "status": subprocess.check_output(["git", "-C", str(checkout), "status", "--porcelain", "--untracked-files=no"], text=True),
-        }
+        versions[name] = source_metadata(checkout)
     (args.output / "provenance.json").write_text(json.dumps(versions, indent=2))
     with (args.output / "packages.txt").open("w") as log:
         subprocess.run([sys.executable, "-m", "pip", "freeze"], stdout=log, check=True)
