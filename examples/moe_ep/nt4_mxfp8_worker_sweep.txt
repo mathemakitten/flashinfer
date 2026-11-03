@@ -1,0 +1,36 @@
+NT4 MXFP8 mixer-tail worker experiment (GB300, EP4)
+
+Run: bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_mxfp8_worker_sweep.sh"
+Set NT4_MXFP8_WORKER_ROOT to choose output. Pass --resume with the same root to
+retain completed arms and archive/rerun incomplete ones. An incomplete recording
+requires a fresh root. Child failures remain failures, including exit crashes.
+
+Eight arms: CUTLASS baseline serial/overlap with decode tactics [39,428], then
+MegaMoE direct serial/overlap at 152, 144, 136 one-CTA clusters. M128/N256/K128,
+group1024, flag_batch=1 and all other MegaMoE settings stay fixed. Prefill/mixed
+calls retain native CUTLASS selection. Tactic IDs are build-specific.
+
+128 requests, 64 generated tokens, full decode graphs, controlled GC, two rounds.
+The first arm records block inputs; every other arm replays those inputs before
+timed forks. Layers 7/32/68, 16 steps per measured round, all four ranks. Eager/
+graph output gates remain enabled. This measures instrumented block timing,
+not E2E speed. Input I/O and synchronization perturb arrival; layer 7 is especially
+sensitive. KV/recurrent state is not independently hashed.
+
+The grid cap is passed to both scheduler grid sizing and communication worker
+counts; it is part of the compile cache key. It does not pin or reserve SMs.
+Each compile emits mxfp8_worker_launch with actual geometry/cap. The script checks
+GB300 152-SM geometry before model loading. This experiment requires syncing the
+modified shim/mxfp8.py, E2E harness and new worker script/summary files.
+
+Output: branch-backend-summary.json (all 384 matched records per arm required).
+Compare total join_us, serial penalty, experts_combine and mixer_post_shared,
+and tail_after_experts_us. Select only if total overlapped completion improves;
+a faster tail by itself is not a win. Confirm a winner in a separate uninstrumented
+128-request/512-output-token E2E comparison against tuned CUTLASS.
+
+Uninstrumented E2E confirmation: nt4_e2e.py --mxfp8-worker-confirm
+--mxfp8-worker-clusters 144 --cutlass-decode-profile-ids 39 428 together with
+--precision mxfp8 --model-graphs --shortcut-overlap --controlled-gc.
+This runs tuned CUTLASS start, capped MegaMoE direct, tuned CUTLASS end.
+Pipeline stays unchanged; no recorded-input or branch timing instrumentation.

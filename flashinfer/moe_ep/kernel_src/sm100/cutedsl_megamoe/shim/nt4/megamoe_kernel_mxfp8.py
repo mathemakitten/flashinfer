@@ -48,6 +48,8 @@ codegen-time quantities.
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import cutlass
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T
 import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64, Int32
@@ -126,6 +128,15 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         combine_format: Optional[CombineFormat] = None,
         skip_output_reduce: bool = False,
         debug_prequant: bool = False,
+        internal_timing: bool = False,
+        sparse_timing: bool = False,
+        pipeline_reduce_side: str = "none",
+        scheduler_lookup: bool = False,
+        lookahead_after_mma: bool = False,
+        fc2_probe_after_issue: bool = False,
+        packed_fc1_activation: bool = False,
+        hardware_tanh: bool = False,
+        detached_tail: bool = False,
         ab_stage_reduction: int = 0,
     ) -> None:
         if skip_output_reduce and (world_size != 1 or fc2_in_kernel_topk_reduce):
@@ -134,6 +145,19 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
             )
         self.skip_output_reduce = skip_output_reduce
         self.debug_prequant = debug_prequant
+        if internal_timing and cluster_shape_mnk != (1, 1, 1):
+            raise ValueError("NT4 internal timing requires 1-CTA clusters")
+        if sparse_timing and (internal_timing or cluster_shape_mnk != (1, 1, 1)):
+            raise ValueError("Sparse timing requires 1-CTA clusters and internal timing off")
+        self.pipeline_reduce_side = pipeline_reduce_side
+        self.sparse_timing = sparse_timing
+        self.internal_timing = internal_timing
+        self.lookahead_after_mma = lookahead_after_mma
+        self.fc2_probe_after_issue = fc2_probe_after_issue
+        self.detached_tail = detached_tail
+        if detached_tail and (token_back_mode != "epi_warps" or fc2_in_kernel_topk_reduce
+                              or cluster_shape_mnk != (1, 1, 1) or use_2cta_instrs):
+            raise ValueError("detached tail requires 1-CTA, epilogue stores, separate reduction")
         if static_expert_shape is None:
             raise NotImplementedError(
                 "Sm100Nt4MegaMoEMxfp8Kernel requires static_expert_shape != None "
@@ -171,6 +195,7 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
             raise ValueError(f"unsupported token_back_mode={token_back_mode!r}.")
 
         super().__init__(
+            scheduler_lookup=scheduler_lookup,
             ab_stage_reduction=ab_stage_reduction,
             mma_tiler_mnk=mma_tiler_mnk,
             cluster_shape_mnk=cluster_shape_mnk,
@@ -195,6 +220,9 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
             generate_c=generate_c,
             use_stg_fc1=use_stg_fc1,
         )
+
+        self.packed_fc1_activation = packed_fc1_activation
+        self.hardware_tanh = hardware_tanh
 
         self.enable_token_comm = True
         self.dispatch_warp_id = (8, 9, 10, 11)
@@ -572,6 +600,9 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
                 )
             )
 
+        if self.internal_timing or self.sparse_timing:
+            # Outside the counter prefix cleared by kernel_tail. One lane per warp writes.
+            specs.append(_RegionSpec("internal_ticks", cutlass.Int64, (1024, 16, 40), 128))
         return specs
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
@@ -1049,6 +1080,13 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
             token_comm_args=token_comm_args,
         )
 
+        # Stream ordering drains every compute CTA before the lightweight
+        # finalizer starts. No compute SMEM/TMEM allocation survives this boundary.
+        if cutlass.const_expr(self.detached_tail):
+            self.detached_tail_kernel(token_comm_args).launch(
+                grid=(1, 1, 1), block=(128, 1, 1), stream=stream,
+            )
+
         # separate_kernel_reduce: collapse the per-topk ``combine_quant`` staging
         # into the public 2D output via the shared TopkReduce launcher (it
         # dequantizes per combine_format -- bf16 pass-through, or fp8+E8M0 -- and
@@ -1103,6 +1141,40 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         )
 
     @cute.jit
+    def internal_now(self):
+        return Int64(llvm.inline_asm(
+            T.i64(), [], "mov.u64 $0, %globaltimer;", "=l",
+            has_side_effects=True, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ))
+
+    @cute.jit
+    def internal_view(self, args):
+        return self._make_typed_view(
+            args.fc1_input_token_buffer,
+            self._local_offsets["internal_ticks"] - self._local_offsets["l1_token_buffer"],
+            cutlass.Int64, (1024, 16, 40), (640, 40, 1), 128,
+        )
+
+    @cute.jit
+    def internal_store(self, args, warp_idx, slot: cutlass.Constexpr, value):
+        if cutlass.const_expr(self.internal_timing or self.sparse_timing):
+            if cute.arch.lane_idx() == 0:
+                bx, by, bz = cute.arch.block_idx()
+                cta = bx + self.cluster_shape_mn[0] * (by + self.cluster_shape_mn[1] * bz)
+                ticks = self._make_typed_view(
+                    args.fc1_input_token_buffer,
+                    self._local_offsets["internal_ticks"] - self._local_offsets["l1_token_buffer"],
+                    cutlass.Int64, (1024, 16, 40), (640, 40, 1), 128,
+                )
+                ticks[cta, warp_idx, slot] = value
+
+    @cute.jit
+    def internal_stamp(self, args, warp_idx, slot: cutlass.Constexpr):
+        if cutlass.const_expr(self.internal_timing):
+            self.internal_store(args, warp_idx, slot, self.internal_now())
+
+    @cute.jit
     def token_comm_hook_dispatch_warp_body(
         self,
         token_comm_args,
@@ -1112,6 +1184,7 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         lane_idx,
         tidx,
     ):
+        self.internal_stamp(token_comm_args, warp_idx, 0)
         self.token_comm.dispatch_warp_body(
             token_comm_args,
             token_comm_storage,
@@ -1119,6 +1192,7 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
             lane_idx=lane_idx,
             tidx=tidx,
         )
+        self.internal_stamp(token_comm_args, warp_idx, 1)
 
     @cute.jit
     def token_comm_hook_token_back_warp_body(
@@ -1163,9 +1237,65 @@ class Sm100Nt4MegaMoEMxfp8Kernel(Sm100ClampedRelu2Mxfp8Fc12Kernel):
         lane_idx,
         tidx,
     ):
-        self.token_comm.kernel_tail(
-            token_comm_args,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-            tidx=tidx,
+        self.internal_stamp(token_comm_args, warp_idx, 4)
+        if cutlass.const_expr(self.detached_tail):
+            # All role-specific async drains above must complete before exit.
+            # Publish each thread's writes before the CTA rendezvous. The next
+            # same-stream kernel replaces the grid-wide completion rendezvous.
+            cute.arch.fence_acq_rel_sys()
+            cute.arch.sync_threads()
+        else:
+            self.token_comm.kernel_tail(
+                token_comm_args,
+                warp_idx=warp_idx,
+                lane_idx=lane_idx,
+                tidx=tidx,
+            )
+        self.internal_stamp(token_comm_args, warp_idx, 5)
+
+    @cute.jit
+    def detached_peer_barrier(self, args, warp_idx, lane_idx, reset_boundary: cutlass.Constexpr = False):
+        # Single CTA: no software grid barrier and no dependence on the original
+        # compute grid size. Preserve the existing cross-PE signal phase counter.
+        cute.arch.sync_threads()
+        if cutlass.const_expr(reset_boundary):
+            self.detached_stamp(args, 34)
+        self.token_comm.nvlink_barrier(
+            args.nvlink_barrier_signal, args.nvlink_barrier_counter,
+            args.grid_sync_counter, args.peer_rank_ptr_mapper,
+            Int32(0), warp_idx, lane_idx, num_sms=1,
+            prologue_grid_sync=False, epilogue_grid_sync=False,
         )
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def detached_stamp(self, args, slot: cutlass.Constexpr):
+        # Reserved row: CTA 0, warp 15, slots 32:37. Never aliases role counters.
+        # A marker observes the issuing thread, not hardware CTA retirement.
+        if cutlass.const_expr(self.internal_timing):
+            if cute.arch.thread_idx()[0] == 0:
+                self.internal_store(args, 15, slot, self.internal_now())
+
+    @cute.kernel
+    def detached_tail_kernel(self, args):
+        tidx = cute.arch.thread_idx()[0]
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        self.detached_stamp(args, 32)
+        self.detached_peer_barrier(args, warp_idx, lane_idx)
+        self.detached_stamp(args, 33)
+        i = Int32(tidx)
+        while i < Int32(cute.size(args.shared_zero_prefix)):
+            args.shared_zero_prefix[i] = Int32(0)
+            i += Int32(128)
+        cute.arch.fence_acq_rel_sys()
+        self.detached_peer_barrier(args, warp_idx, lane_idx, reset_boundary=True)
+        self.detached_stamp(args, 35)
+        # Reset local state only after the last barrier has stopped using it.
+        i = Int32(tidx)
+        while i < Int32(cute.size(args.local_zero_prefix)):
+            args.local_zero_prefix[i] = Int32(0)
+            i += Int32(128)
+
+        # No new rendezvous: this is thread 0 reset completion, not all-CTA exit.
+        self.detached_stamp(args, 36)

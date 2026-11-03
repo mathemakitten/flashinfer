@@ -1,0 +1,34 @@
+NT4 MXFP8 A/B pipeline resource experiment
+
+Run bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_mxfp8_pipeline_sweep.sh".
+Set NT4_MXFP8_PIPELINE_ROOT to choose output; use --resume with that same root.
+Use a separate idle four-GPU GB300 node from the worker-count experiment.
+
+Eight matched-input arms: tuned CUTLASS [39,428] serial/overlap, then MegaMoE
+serial/overlap with 0, 1, 2 fewer A/B stages. All direct arms retain 152 workers,
+M128/N256/K128, cluster1, group1024, flag_batch=1 and two accumulator stages.
+A and B each lose the selected number of stages; B's original extra stage,
+if present, is preserved relative to A. A minimum of two stages is enforced.
+
+This reduces shared-memory pipeline allocation, not TMEM or registers. Current
+kernel requests the architecture maximum TMEM allocation. Smaller N is not an
+admitted NT4 geometry and is deliberately not enabled by this experiment.
+Each compile emits nt4_mxfp8_pipeline_resources with stage counts, thread count,
+TMEM columns, freed A/B bytes and estimated shared-memory layout budget. This
+is not compiler register/spill telemetry or measured occupancy. Inspect those
+records in direct logs before interpreting results.
+
+128 requests, 64 generated tokens, two rounds, full decode graphs, controlled
+GC; 16 instrumented steps at layers 7/32/68 per round on all four ranks. Native
+CUTLASS records inputs; other arms replay them. Eager/graph output validation
+remains mandatory. Recorded inputs do not independently certify KV/recurrent
+state; timings include waiting and instrumentation perturbation. Not E2E speed.
+
+Output branch-backend-summary.json validates 384 input-matched records per arm
+and exact requested settings from arm summaries. Rank arrival skew makes layer7
+less reliable. Select by overlapped total block completion and compare the serial
+penalty. Do not select only on tail duration. Confirm a winner separately E2E.
+
+No default pipeline or tactic changes. Sync the entire modified FlashInfer
+checkout, including shim/mxfp8.py and shim/nt4 files, before launching.
+CPU tests pass locally; GPU compilation/correctness/performance remain untested.

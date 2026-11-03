@@ -1,0 +1,65 @@
+NT4 TRTLLM-gen integration (development)
+
+Sync both the FlashInfer integration branch and TRTLLM-gen activation branch.
+The two-FC1 smoke export is insufficient: export mxfp8_nt4_integration.json,
+which includes static/persistent FC1 and FC2 from the same generator build.
+The initial implementation exposes tile 16 for ClampedRelu2 only. It is not a
+full tactic inventory or a speed-of-light benchmark. Existing default artifacts
+and CUTLASS/MegaMoE paths are unchanged.
+
+On the existing GB300 allocation, with the usual PY, FLASHINFER_CHECKOUT,
+MCORE_CHECKOUT, NT4_LOG_DIR, TRTLLM_GEN_ROOT and NT4_TRT_BUILD_DIR:
+
+  unset NT4_TRT_EXPORT_DIR
+  bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_trtllm_clamped.sh"
+
+This reuses the already-built generator, exports four kernels with native
+reference checks, and runs EP4 saved-checkpoint validation. No full model load.
+The FlashInfer API is trtllm_fp8_block_scale_routed_moe with MXFP8,
+activation_type=ActivationType.ClampedRelu2.value and gemm1_clamp_limit holding
+one positive finite CUDA FP32 value per local expert (128 entries of 16 for NT4).
+This differs from CUTLASS's one-element clamped_relu2_limit argument.
+
+FLASHINFER_TRTLLM_NT4_EXPORT points to the complete export root, not artifact/.
+Set it before importing/first using FlashInfer, in a fresh process. Headers,
+manifest, cubins and path participate in a separate JIT cache identity. Do not
+mutate an export in a running process. Cubins still undergo the manifest hash
+check when loaded. The old shipped headers are never merged with the new ABI.
+Unset the variable in a new process to return to the shipped TRTLLM backend.
+The initial local inventory does not serve other TRTLLM activation/dtype modes.
+
+Validation checks the real NT4 weights/dimensions and captured routes, independent
+FP32/quantized clamped reference math, eager/graph replay, changed per-expert
+clamp scales, changed routes, empty routes, poisoned output buffers, and restored
+routes. Scale values are checked by construction outside graph capture. The
+API does only metadata checks in the hot path; callers must preserve positivity
+and finiteness when updating scales. Existing provisional numerical budgets are
+retained; passing is not a full-model generation-quality claim.
+
+Return the export validation.json and flashinfer-preflight.log. Performance and
+full-model shortcut overlap comparisons come after this numerical gate.
+
+Real NT4 E2E comparison (sync both repositories first)
+----------------------------------------------------
+  bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_trtllm_clamped_sweep.sh"
+Optional positional request counts: 32 128 512 (default all three).
+
+Exports 16 kernels: FC1/FC2, static/persistent, token tiles 16/32/64/128.
+Tile 128 uses two AB stages; others retain three. Exporter correctness and the
+EP4 preflight must pass before E2E launches. These new configurations require
+GPU validation; a failed candidate stops export rather than being timed.
+
+Each count runs tuned CUTLASS [39,428], MegaMoE hybrid, actual clamped TRTLLM,
+then tuned CUTLASS again. All use the same prompts, 512 generated tokens,
+controlled GC, full decode graphs and shortcut overlap. Prefill is unchanged.
+The TRTLLM arm substitutes every eligible decode MoE layer, uses real clamped
+outputs for continuation, and tunes local tactics before graph capture.
+This is not the old unclamped surrogate/native-continuation diagnostic.
+
+Results: $NT4_TRT_COMPARE_ROOT/requests{32,128,512}/summary.json
+Use trial_backend_labels (hybrid and TRTLLM both use adapter mode 'direct').
+Check requested_batch_reached in each measured result, eager/graph validation,
+output comparisons, and start/end control drift before claiming a speedup.
+Cross-backend greedy output equality is reported, not assumed; this benchmark
+alone does not establish model quality. Local CPU checks cannot validate GPU
+correctness or predict performance.

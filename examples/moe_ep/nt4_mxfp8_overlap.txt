@@ -1,0 +1,43 @@
+NT4 MXFP8 shortcut overlap
+=========================
+Sync both repositories:
+  flashinfer-nt4-gb300-nvls (examples/moe_ep plus the existing NT4 kernels)
+  megatron-lm (native FlashInfer expert stages and config validation)
+Use a separate GB300 node from any BF16 timing job.
+
+First run:
+  bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_mxfp8_overlap.sh"
+
+This first runs the native staged-expert tests, then loads the real NT4 checkpoint
+three times: FlashInfer CUTLASS + NVLS, MegaMoE direct, FlashInfer CUTLASS + NVLS.
+128 requests, 64 output tokens by default, two measured rounds per arm. The short
+run validates integration; use the 512-token run for deployment timing:
+  NT4_GENERATE_TOKENS=512 bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_mxfp8_overlap.sh" e2e
+
+All arms use native FlashInfer CUTLASS MXFP8 + NVLS for prefill/mixed batches.
+They share the existing shortcut fork/join schedule, controlled GC, full-language-
+model decode graphs, prompt file and checkpoint. The direct arm replaces eligible
+MXFP8 decode routed branches with the existing tuned MXFP8 MegaMoE configuration.
+Selective BF16 layers remain native. This is not a vLLM MXFP8 GEMM comparison.
+
+Native stages:
+  prepare: retain gathered BF16 activations, FP32 probabilities and live routes
+  compute: existing MXFP8 quantization + CUTLASS expert/ClampedRelu2 computation,
+           including the existing copy into the FP32 symmetric NVLS output buffer
+  finish: return the local expert sum for unchanged NVLS combine
+The caller owns the shortcut stream, event ordering and join. This initial version
+does not split quantization out of compute or add a CUTLASS MXFP8 worker cap.
+The vLLM expert_max_blocks control must be zero for native FlashInfer stages.
+
+Checks:
+- CPU command-generation and stage-contract checks were run locally.
+- GPU tests compare native staged vs serial expert outputs exactly, under replay
+  and changed input/route masks, including all-padding rows.
+- E2E retains MegaMoE's independent numerical gate and own eager/model-graph output
+  checks, graph-capture layer coverage, and per-step graph replay accounting.
+- Cross-backend generated sequences are reported, not assumed bit-identical.
+- Actual GPU validation and performance remain pending until the remote run.
+
+Outputs: $NT4_LOG_DIR/nt4-mxfp8-overlap-TIMESTAMP/stages.log and e2e/summary.json,
+with per-arm logs and generated outputs. Reuse persistent JIT caches; no clean
+build is required by this Python integration change.

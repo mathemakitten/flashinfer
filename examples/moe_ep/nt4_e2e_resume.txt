@@ -1,0 +1,50 @@
+NT4 clamped three-way comparison: backend-level resume
+
+After the current sweep has fully stopped, sync nt4_e2e.py and
+nt4_e2e_resume.py (plus the separately prepared numerical-checker fix).
+Use the SAME nt4_e2e.py command, SAME --output requests<N> directory,
+original flags, export and environment, adding:
+
+    --resume --resume-legacy
+
+--resume-legacy explicitly acknowledges missing provenance for runs made
+before this feature. It is required only on initial adoption of an old run.
+Do not run concurrently with the old driver: old drivers do not acquire the
+new advisory lock. No git installation is needed.
+
+Supported scope: --trtllm-clamped-compare only, not every NT4 sweep driver.
+The parent shell sweep does not automatically gain --resume. Invoke nt4_e2e.py
+for each failed request size using its original options (the current working
+sweep uses 64 generated tokens, two rounds, budget2048, MXFP8, model graphs,
+shortcut overlap, controlled GC, hybrid and CUTLASS tactics39,428).
+
+The driver:
+- Checks saved launch commands and configuration; hashes prompts and source
+  manifest. New runs save environment provenance. Legacy runs cannot recover
+  old environment/source hashes and are marked accordingly.
+- Reuses only full measured rounds, EXACT own eager/graph outputs, requested
+  occupancy, expected output count, finite throughput, output artifacts,
+  four cleanup records, no detected traceback/segfault, and successful exit
+  receipt (or explicit legacy inference from complete logs).
+- Archives failed/partial backend directories, logs, commands and exit receipts
+  in attempt-history/<timestamp>/ before retrying. Existing summary/status is
+  also archived. Successful reused backends stay in place.
+- Always runs baseline-end afresh; retries continue after a backend failure so
+  other backends and the closing control can finish. Failures still return a
+  nonzero driver exit status, and cannot be reused on a later resume.
+- Records progress in resume-status.json even if there is no final summary.
+  It marks comparison_valid=false if any backend failed or the fresh closing
+  CUTLASS median differs from the opening control by >3%. This heuristic is a
+  drift screen, not statistical proof of comparability across nodes/days.
+- Keeps failed numerical gates. Resume does not make TRTLLM's numerical error
+  valid, change tolerances, or certify cross-backend generated-token equality.
+
+The v5 checker change may intentionally differ between an old reused result
+and a retry; the checker hash is recorded for new trials. If changing kernels,
+model code, checkpoint contents, export contents or performance-affecting
+settings, use a fresh run rather than recycling old performance results.
+A legacy run cannot prove those inputs were unchanged.
+
+Local tests (no GPU or FlashInfer import):
+    python3 tests/moe_ep/test_nt4_e2e_resume.py
+GPU end-to-end resume remains to be validated after sync.

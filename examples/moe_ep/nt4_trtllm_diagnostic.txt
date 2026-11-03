@@ -1,0 +1,83 @@
+NT4 TRTLLM numerical investigation
+
+Use --qualify --graph to inspect every row and emit a fail-closed qualification
+record. FC1 boundary explanations, input quantization, FC2 using actual
+intermediates, recombination, exact-zero rows, coverage and replay checks are
+required. The existing 1.5% global/worst-row output limit remains independent:
+stages_status=PASS does not imply status=PASS. The known 1.577% worst-row
+snapshot is still expected to FAIL overall. These checks remain provisional;
+they do not establish model quality or the generator tanh accuracy contract.
+
+1. Sync the diagnostic files after the current sweep stops. Start a fresh
+   process for the TRTLLM comparison. The original numerical gate still raises.
+   Before raising, a failing rank now writes:
+       <NT4_E2E_OUTPUT>/numerical-failures/rank<N>-<timestamp>/failure.pt
+       <same>/manifest.json
+   NT4_TRT_FAILURE_ROOT can override the destination for standalone preflight.
+   No polling or per-step writes. One snapshot is approximately 0.8GB because
+   it preserves this rank's128 expert weights and the full routing geometry.
+   It records the selected tactic and packed-weight hashes. A missing manifest
+   means the capture did not finish. Other ranks need not produce an artifact.
+
+2. Replay ONE failing rank on ONE GPU; no torchrun, NVSHMEM, MCore, or full-model
+   checkpoint load is needed (the environment still needs the normal FlashInfer
+   CUDA dependencies and the original TRTLLM export):
+
+   "$PY" "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_trtllm_diagnostic.py" \
+     --artifact /path/to/numerical-failures/rank3-TIMESTAMP \
+     --output "$NT4_LOG_DIR/trtllm-numerical-$(date +%Y%m%d-%H%M%S)" \
+     --worst-tokens 4 --graph
+
+   This enables NT4_TRT_DEBUG_INTERMEDIATES in that process only. The launcher
+   appends owned FC1 FP8 bytes/scales, FC2 output, routing map, and expert counts;
+   Python retains these for untimed inspection. It may rebuild the FlashInfer
+   binding. No TRTLLM-gen GEMM cubin regeneration is needed. Do not set this env
+   variable for E2E timing. The private workspace ABI is intentionally not public.
+
+3. Send diagnostic.json first. intermediates.pt contains the raw workspace
+   tensors if needed. The report includes:
+   - exact packed-weight reproduction; captured tactic pinned for replay;
+   - saved-output vs replay, repeated launches, optional local graph/eager check;
+   - independent input quantization comparison, including bytes/scales;
+   - worst-token reference norms and per-token cancellation ratios;
+   - per-expert FC1 activation/quantization vs independent FP64 reference and
+     the existing operand-derived boundary model;
+   - FC2 vs FP64 GEMM using TRTLLM's ACTUAL quantized FC1 output;
+   - reconstructed routing-weight sum, with FP32/BF16 cast variants.
+
+Interpretation limits:
+- snapshot_exact=false means the original failure was not reproduced exactly;
+  inspect tactic, export, device and environment before attributing a cause.
+- Raw FC1 accumulators and post-activation/prequant values do not exist in these
+  buffers: that epilogue is fused. If FC1 has unexplained blocks, this localizes
+  the discrepancy to FC1+activation+quantization, not to one of its substeps.
+  Separating those needs generator instrumentation of that specific tactic.
+- The FC1 error envelope is provisional and assumes the owned activation's
+  tanh accuracy contract; TRTLLM lowering must be inspected before treating a
+  boundary rejection as proof of a defect.
+- FC2 and weighted-sum results are diagnostic comparisons, not new acceptance
+  gates. Layout/rounding differences must be accounted for before judging them.
+- No performance claims, tolerance changes, or cross-backend token-equality
+  claims are made by this script. Existing E2E gates remain active.
+
+Local CPU tests cover metrics, capture integrity/hash checking, and the 128x4
+scale layout. C++ binding compilation and actual GPU replay remain unvalidated.
+
+Older snapshots containing a TVM-FFI tactic Array require
+--trusted-legacy-snapshot for replay. Use this only with a snapshot generated
+by your own trusted diagnostic run: it enables unrestricted pickle loading.
+New captures store the tactic as plain Python integers and retain restricted
+weights-only loading by default. No checkpoint recapture is needed for an
+existing complete snapshot.
+
+The auxiliary expert-count workspace may be absent from the launcher result.
+The report records expert_counts_available=false and saves counts=None in that
+case. FC1 bytes/scales, FC2 output and the routing map remain mandatory. Counts
+are not used to compute any numerical comparison.
+
+Intermediate scale decoding uses the export's expanded-config.json. It requires
+all ClampedRelu2 FC1 producers and MXFP8-to-BF16 FC2 consumers to agree on one
+layout. The October 20 NT4 export uses 8x4, not 128x4. Mixed-layout exports are
+rejected until selected-tactic metadata is available. The old 128x4-derived
+FC1/FC2 metrics must not be used; snapshot/output checks remain independent of
+this decoder correction.

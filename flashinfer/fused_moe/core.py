@@ -3278,6 +3278,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
             """Launch the unchanged FP8 block-scale operation with one tactic."""
+            if activation_type == ActivationType.ClampedRelu2.value:
+                from .nt4_diagnostic import select_tactic
+
+                tactic = select_tactic(tactic)
             # Preserve the exact DeepSeek/MXFP8 ordinary ABI selected by runner configuration.
             intermediate_output = moe_op.trtllm_fp8_block_scale_moe(
                 routing_input_mode,
@@ -3323,6 +3327,29 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 valid_hidden_size,
                 valid_intermediate_size,
             )
+            if os.environ.get("NT4_EXPERT_INTERNAL_TIMING") == "1" and os.environ.get("NT4_TRT_DEBUG_INTERMEDIATES") == "1":
+                raise RuntimeError("Use phase timing and intermediate dumps in separate processes")
+            # Explicit eager-only diagnostic; never enabled by ordinary E2E runs.
+            if os.environ.get("NT4_TRT_DEBUG_INTERMEDIATES") == "1":
+                from .nt4_diagnostic import record
+
+                expected_count = (1 if do_finalize else 3) + 5
+                if (
+                    gemm1_lora_delta is not None
+                    or len(intermediate_output) != expected_count
+                ):
+                    raise RuntimeError(
+                        "NT4 diagnostic workspace ABI mismatch; sync/rebuild the binding; LoRA is unsupported"
+                    )
+                record(intermediate_output[-5:], tactic)
+                intermediate_output = intermediate_output[:-5]
+            if os.environ.get("NT4_EXPERT_INTERNAL_TIMING") == "1":
+                from .nt4_phase_timing import record as record_phase_ticks
+
+                if len(intermediate_output) != (1 if do_finalize else 3) + 1 or gemm1_lora_delta is not None:
+                    raise RuntimeError("NT4 phase timer ABI mismatch; rebuild diagnostic binding")
+                record_phase_ticks(intermediate_output[-1])
+                intermediate_output = intermediate_output[:-1]
             # Reconstruct the public result without exposing dtype-specific body workspaces.
             return _unpack_trtllm_moe_output(
                 intermediate_output,

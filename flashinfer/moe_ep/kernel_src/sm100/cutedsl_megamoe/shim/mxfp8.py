@@ -415,6 +415,17 @@ class MegaMoEMxfp8Frontend:
             torch.cuda.current_stream().cuda_stream,
         )
 
+    def _hardware_tanh_enabled(self) -> bool:
+        if os.environ.get("NT4_HARDWARE_TANH") != "1":
+            return False
+        selection = os.environ.get("NT4_HARDWARE_TANH_LAYERS", "")
+        if not selection:
+            return True
+        layer = getattr(self, "_nt4_layer_number", None)
+        if layer is None:
+            raise RuntimeError("layer-selective tanh requires frontend layer identity")
+        return layer in {int(value) for value in selection.split(",")}
+
     def _mega_compile_key(self) -> tuple:
         c = self.config
         return (
@@ -448,6 +459,16 @@ class MegaMoEMxfp8Frontend:
             c.local_only,
             c.return_contributions_only,
             os.environ.get("NT4_DEBUG_PREQUANT") == "1",
+            os.environ.get("NT4_LOOKAHEAD_AFTER_MMA") == "1",
+            os.environ.get("NT4_FC2_PROBE_AFTER_ISSUE") == "1",
+            os.environ.get("NT4_PACKED_FC1_ACTIVATION") == "1",
+            self._hardware_tanh_enabled(),
+            os.environ.get("NT4_FC1_DIRECT_STORE") == "1",
+            6 if os.environ.get("NT4_EXPERT_INTERNAL_TIMING") == "1" else 0,
+            os.environ.get("NT4_EXPERT_SPARSE_TIMING") == "1",
+            os.environ.get("NT4_PIPELINE_REDUCE_SIDE", "none"),
+            os.environ.get("NT4_DETACHED_TAIL") == "1",
+            os.environ.get("NT4_SCHED_LOOKUP") == "1",
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoEMxfp8Inputs) -> _CompiledMega:
@@ -501,15 +522,55 @@ class MegaMoEMxfp8Frontend:
             )
         group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
 
+        detached_tail = os.environ.get("NT4_DETACHED_TAIL", "0")
+        if detached_tail not in ("0", "1"):
+            raise ValueError("NT4_DETACHED_TAIL must be 0 or 1")
+        if detached_tail == "1" and (c.activation != "clamped_relu2" or c.enable_iket
+                                     or os.environ.get("MEGA_USE_NCU", "0") != "0"):
+            raise ValueError("detached tail supports NT4 only, without IKET/NCU replay")
+        side = os.environ.get("NT4_PIPELINE_REDUCE_SIDE", "none")
+        if side not in ("none", "a", "b", "a_plus_b_minus") or (side != "none" and
+                (c.activation != "clamped_relu2" or c.ab_stage_reduction != 0)):
+            raise ValueError("Independent pipeline reduction requires NT4 and AB reduction=0")
+        probe_after = os.environ.get("NT4_FC2_PROBE_AFTER_ISSUE", "0")
+        if probe_after not in ("0", "1") or (probe_after == "1" and c.activation != "clamped_relu2"):
+            raise ValueError("NT4_FC2_PROBE_AFTER_ISSUE requires 0/1 and NT4 activation")
+        direct_store = os.environ.get("NT4_FC1_DIRECT_STORE", "0")
+        if direct_store not in ("0", "1"):
+            raise ValueError("NT4_FC1_DIRECT_STORE must be 0 or 1")
+        if direct_store == "1" and c.activation != "clamped_relu2":
+            raise ValueError("direct FC1 store experiment supports NT4 only")
+        lookup = os.environ.get("NT4_SCHED_LOOKUP", "0")
+        if lookup not in ("0", "1") or (lookup == "1" and c.activation != "clamped_relu2"):
+            raise ValueError("NT4_SCHED_LOOKUP requires 0/1 and NT4 activation")
         kernel_type = Sm100MegaMoEMxfp8Kernel
         nt4_kwargs = {}
         if c.activation == "clamped_relu2":
             from .nt4.megamoe_kernel_mxfp8 import Sm100Nt4MegaMoEMxfp8Kernel
 
             kernel_type = Sm100Nt4MegaMoEMxfp8Kernel
+            nt4_kwargs["detached_tail"] = detached_tail == "1"
             nt4_kwargs["ab_stage_reduction"] = c.ab_stage_reduction
             nt4_kwargs["skip_output_reduce"] = c.return_contributions_only
             nt4_kwargs["debug_prequant"] = os.environ.get("NT4_DEBUG_PREQUANT") == "1"
+            nt4_kwargs["hardware_tanh"] = self._hardware_tanh_enabled()
+            nt4_kwargs["use_stg_fc1"] = direct_store == "1"
+            nt4_kwargs["packed_fc1_activation"] = os.environ.get("NT4_PACKED_FC1_ACTIVATION") == "1"
+            nt4_kwargs["fc2_probe_after_issue"] = probe_after == "1"
+            nt4_kwargs["lookahead_after_mma"] = os.environ.get("NT4_LOOKAHEAD_AFTER_MMA") == "1"
+            nt4_kwargs["pipeline_reduce_side"] = side
+            nt4_kwargs["scheduler_lookup"] = lookup == "1"
+            nt4_kwargs["sparse_timing"] = os.environ.get("NT4_EXPERT_SPARSE_TIMING") == "1"
+            nt4_kwargs["internal_timing"] = os.environ.get("NT4_EXPERT_INTERNAL_TIMING") == "1"
+        if "NT4_SCHED_LOOKUP" in os.environ:
+            print(f'{{"stage":"nt4_scheduler_lookup","rank":{c.rank},"enabled":{str(lookup == "1").lower()},"group_hint":{group_hint}}}', flush=True)
+        if "NT4_FC2_PROBE_AFTER_ISSUE" in os.environ:
+            print(f'{{"stage":"nt4_fc2_probe_config","rank":{c.rank},'
+                  f'"after_issue":{str(probe_after == "1").lower()}}}', flush=True)
+        if "NT4_FC1_DIRECT_STORE" in os.environ:
+            print(f'{{"stage":"nt4_fc1_store_config","rank":{c.rank},'
+                  f'"use_stg_fc1":{str(direct_store == "1").lower()},'
+                  f'"group_hint":{group_hint},"rows":{c.num_tokens_per_rank}}}', flush=True)
         kernel = kernel_type(
             **nt4_kwargs,
             mma_tiler_mnk=c.mma_tiler_mnk,
@@ -580,6 +641,23 @@ class MegaMoEMxfp8Frontend:
         if c.enable_iket:
             compile_kwargs["options"] = "iket"
 
+        # Opt-in assembly inspection: only rank 0, with files on node-local disk.
+        dump_root = os.environ.get("NT4_KERNEL_DUMP_DIR")
+        if dump_root and os.environ.get("RANK", "0") == "0":
+            import hashlib
+            import json
+            from pathlib import Path
+
+            dump = Path(dump_root) / hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+            dump.mkdir(parents=True, exist_ok=True)
+            (dump / "config.json").write_text(json.dumps({
+                "config": dataclasses.asdict(c), "compile_key": repr(key),
+                "kernel": type(kernel).__name__,
+            }, default=str, indent=2))
+            compile_kwargs["options"] = (
+                compile_kwargs.get("options", "")
+                + f" --keep-ptx --keep-cubin --dump-dir={dump}"
+            )
         mega.compiled = cute.compile(kernel, **compile_kwargs)
         if not c.in_kernel_fc2_reduce and not c.return_contributions_only:
             from .clear_invalid_combine import ClearInvalidCombine

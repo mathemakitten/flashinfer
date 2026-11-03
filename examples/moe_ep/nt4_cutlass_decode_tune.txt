@@ -1,0 +1,70 @@
+NT4 CUTLASS MXFP8 decode tactic audit and sweep
+============================================
+Run on a separate four-GPU GB300 node after syncing FlashInfer:
+
+  export NT4_CUTLASS_ARTIFACT="$NT4_LOG_DIR/nt4-checkpoint-layer-20261012-080901"
+  bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_cutlass_decode_tune.sh"
+
+Use a complete nt4_routed_checkpoint_v1 artifact, not the branch hidden-state
+recording. The example is the earlier real-prompt checkpoint-layer capture.
+It is not a newly captured 128-request decode. To study that occupancy, point
+NT4_CUTLASS_ARTIFACT at a complete real-128 layer capture. Never duplicate rows
+to simulate routing diversity. Audit files report actual occupancy and all 512
+expert assignment counts. All saved samples are used without resampling.
+
+Outputs
+-------
+audit-rank*.json: artifact, GPU, actual automatic tactic choices, valid FC1/FC2
+IDs, buffer rows, active rows and per-expert assignments.
+trials-rank*.jsonl: incremental timings and local correctness metrics.
+rejections-rank*.jsonl: candidate IDs, sample, repeated eager/graph comparisons,
+mismatch counts/magnitudes and example elements on every rank.
+recommendation.json: best common pair, baseline drift, confirmation and eligibility.
+NT4_CUTLASS_TUNE_ROOT overrides the default timestamped result directory.
+There is a two-hour external watchdog; partial records survive a failure.
+The script does not resume partial sweeps.
+
+Scope
+-----
+Four local expert shards consume concatenated, byte-verified saved inputs/routes.
+Weight scale packing is checked by an exact byte round trip. Baseline shard
+outputs are FP32-reduced and compared against the captured output. Every tactic
+must pass the provisional global/per-row 1.5% L2 gate versus the automatic local
+output, finite/empty-row checks, and exact own eager/graph replay. These are
+screening checks, not the independent boundary-aware MegaMoE validation gate.
+
+Measures quantization + whole local CUTLASS expert operation including activation
+and finalize under CUDA graphs. No NVLS communication or shortcut contention.
+Timing uses the slowest rank per round. Warmup, packing, allocation for graph
+construction, validation and inter-rank control collectives are outside timing.
+
+Search is coordinate descent: FC1 sweep, FC2 sweep, FC1 refinement. It is not an
+exhaustive Cartesian search. IDs are filtered using the existing runner's
+occupancy/activation support checks. Unsupported runtime shapes fail closed.
+The full expert operation sees actual saved routing; the built-in GEMM profiler
+only receives dimensions/weights and does not receive these routing tensors.
+Tile geometries are not exposed by the current Python runner; audit reports IDs,
+not guessed tile shapes. No C++ changes or forced clean build are required.
+
+Start/end automatic controls must drift <=3%. A candidate must improve every
+sample >=2% against the faster control, including a final repeated measurement.
+Any recommendation remains provisional: confirm on fresh real decode samples,
+then in a full-model graph overlap E2E run before changing defaults. Do not copy
+tactic IDs to another FlashInfer build without re-enumerating and revalidating.
+
+Candidate rejection
+-------------------
+Two extra eager launches and three graph replays must exactly match an independent
+cloned eager snapshot. A numerical/equality failure rejects the candidate on all
+ranks and excludes it from ranking. Automatic controls and final confirmation
+still fail the experiment if validation fails. CUDA/runtime failures remain fatal.
+This does not relax tolerances or assume small nondeterministic differences are
+acceptable. It supplies evidence to investigate rejected tactics independently.
+
+E2E confirmation: nt4_e2e.py --cutlass-decode-profile-ids FC1 FC2
+requires --precision mxfp8 --shortcut-overlap --model-graphs --controlled-gc.
+Runs default CUTLASS start, decode-tuned CUTLASS, default CUTLASS end.
+The experimental adapter overrides only eligible decode calls (including graph
+capture); prefill/mixed calls retain native selection. Full graph/eager output
+validation remains enabled. Tactic IDs are specific to the synced FlashInfer build.
+Sync nt4_e2e.py, nt4_e2e_graph.py and nt4_cutlass_decode_override.py together.

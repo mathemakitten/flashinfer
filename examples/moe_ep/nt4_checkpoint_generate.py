@@ -31,6 +31,19 @@ def main():
 
     import megatron.training
 
+    if os.environ.get("NT4_SERIALIZE_SHORTCUT_SIDE_STREAM") == "1":
+        from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+
+        if "_nt4_serialize_side_stream" not in (
+            ShortcutMoEBlock._forward_inference_overlap.__code__.co_consts
+        ):
+            raise RuntimeError("sync the serialized-side diagnostic to MCore first")
+        ShortcutMoEBlock._nt4_serialize_side_stream = True
+        print(json.dumps(dict(
+            stage="shortcut_serialized_side_stream_diagnostic",
+            rank=int(os.environ.get("RANK", "0")), performance_use=False,
+        )), flush=True)
+
     root = Path(megatron.training.__file__).resolve().parents[2]
     for relative in ("examples/multimodal", "examples/inference/gpt"):
         sys.path.append(str(root / relative))

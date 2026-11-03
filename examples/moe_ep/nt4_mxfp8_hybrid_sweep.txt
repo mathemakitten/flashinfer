@@ -1,0 +1,39 @@
+MXFP8 hybrid matched-input comparison on EP4 GB300
+
+Run: bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_mxfp8_hybrid_sweep.sh"
+Optional output: NT4_MXFP8_HYBRID_ROOT. Resume: set this to the existing root
+and pass --resume. Successful arm summaries are retained; incomplete replay
+arms are archived. Incomplete recording requires a new root.
+
+Six arms: tuned CUTLASS [39,428] + NVLS, direct MegaMoE, hybrid MegaMoE + NVLS;
+each serial and overlapped. 128 requests, 64 output tokens, 2 measured rounds.
+All use model decode graphs, controlled GC, and native MXFP8 prefill. No worker
+cap or pipeline reduction. Baseline-overlap records inputs; every other arm
+replays them. Summary validates hashes, decode steps, 384 records per arm and
+configuration provenance. Send branch-backend-summary.json and arm summaries.
+
+Hybrid uses the existing fused-glue NvlsHybrid prototype: fixed padded-bucket
+NVLS gather -> local route mask/quantization/packing -> local fused experts ->
+FP32 weighted partials -> NVLS reduction -> output cast. ALL this work is timed
+on the shortcut expert stream. It does not independently overlap NVLS dispatch
+with the mixer; this tests the existing complete composition, not an isolated
+GEMM or an optimized staged dispatcher. Hybrid uses current bucket rows, not
+maximum model capacity, for symmetric buffers. Per-layer/per-bucket buffers
+are allocated before capture and held until graphs are destroyed.
+
+Untimed gates: existing independent direct validation; hybrid vs live CUTLASS
+and direct; fused helper checks; poisoned all-padding eager and graph replay;
+changed/restored routes; whole-model graph vs own eager generation. Failure
+stops the run. No timing from a failed arm is accepted. Local CPU tests cannot
+validate CUDA/NVLS behavior; first remote run is also the GPU integration test.
+
+These instrumented block timings include marker/wait costs and input replay
+perturbs execution/cache history. They are NOT E2E throughput results. Layer 7
+is especially sensitive to arrival skew. KV/recurrent states are not hashed.
+
+E2E confirmation: nt4_e2e.py --mxfp8-nvls-hybrid without branch diagnostics,
+with --precision mxfp8 --model-graphs --shortcut-overlap --controlled-gc
+--cutlass-decode-profile-ids 39 428. Runs tuned CUTLASS baseline-start,
+hybrid, tuned CUTLASS baseline-end. Recommend 128 requests, 512 output tokens,
+5 measured rounds. No worker/pipeline overrides. The hybrid flag is enabled
+only in the hybrid child; CUTLASS tactic overrides only in baseline children.

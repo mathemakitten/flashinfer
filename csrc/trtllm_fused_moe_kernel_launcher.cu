@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -4416,6 +4417,17 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   Fp8QuantizationType quantization_type;
 
  public:
+  // Untimed NT4 diagnostic only. Return owned tensors so workspaces survive
+  // launcher destruction. Raw FC1 accumulators are fused and not materialized.
+#ifdef FLASHINFER_NT4_INTERNAL_TIMING
+  Tensor nt4_phase_ticks;
+#endif
+  Array<Tensor> nt4_diagnostic_buffers() const {
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8);
+    return {gemm1_output, gemm1_output_scale, gemm2_output,
+            expanded_idx_to_permuted_idx, num_tokens_per_expert};
+  }
+
   // Override to handle pre-computed routing.
   MoeRunResultBuffers run(int64_t moe_tactic, bool enable_pdl = true,
                           bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
@@ -4456,6 +4468,12 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     check_moe();
     prepare_moe(moe_tactic);
 
+#ifdef FLASHINFER_NT4_INTERNAL_TIMING
+    if (!nt4_phase_ticks.defined()) {
+      nt4_phase_ticks = alloc_tensor({4}, dl_int64, hidden_states.device());
+    }
+    workspace.nt4_phase_ticks = static_cast<int64_t*>(nt4_phase_ticks.data_ptr());
+#endif
     cudaStream_t moe_stream = get_stream(hidden_states.device());
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
@@ -5780,11 +5798,22 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
       << "Ordinary FP8 block-scale MoE cannot consume a DA body workspace.";
 
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
-  return selected_launcher
+  auto result = selected_launcher
       ->run(config, enable_pdl, false /* use_routing_scales_on_input */,
             quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */,
             gemm1_lora_delta.has_value())
       .to_ffi();
+#ifdef FLASHINFER_NT4_INTERNAL_TIMING
+  result.push_back(selected_launcher->nt4_phase_ticks);
+#endif
+  auto const diagnostic = std::getenv("NT4_TRT_DEBUG_INTERMEDIATES");
+  if (diagnostic != nullptr && std::strcmp(diagnostic, "1") == 0) {
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8);
+    for (auto const& tensor : selected_launcher->nt4_diagnostic_buffers()) {
+      result.push_back(tensor);
+    }
+  }
+  return result;
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(

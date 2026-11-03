@@ -27,6 +27,8 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from moe_nvfp4_swapab.epilogue import SwapABSwigluFp4Epilogue, _TmemTranspose16x32Core
 from .epilogue_mxfp8 import GluMxfp8Epilogue
+from .scheduler_fc2_clc import Fc2ClcScheduler
+from .scheduler_group_lookup import GroupedLookupScheduler
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     BlockPhase,
     MoEFusedFc12SchedulerParams,
@@ -75,7 +77,10 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         group_hint: int,
         token_padding_block: int,
         sf_padding_block: int,
-        load_balance_mode: Literal["static", "atomic_counter"] = "static",
+        load_balance_mode: Literal["static", "atomic_counter", "clc", "fc2_static", "fc2_grid"] = "static",
+        diagnostic_clc_tiles: int = 0,
+        scheduler_lookup: bool = False,
+        scheduler_single_group: bool = False,
         # Optional sched knobs (None = sane internal default).
         # ``static_expert_shape`` binds (experts, intermediate_gateup, hidden)
         # at codegen time; None keeps those dims runtime-dynamic.
@@ -95,7 +100,50 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         apply_topk_in_fc1: bool = False,
         generate_c: bool = False,
         use_stg_fc1: bool = False,
+        diagnostic_stage: int = 0,
+        fc2_tile_n: Optional[int] = None,
+        fc2_acc_release: str = "auto",
     ) -> None:
+        if diagnostic_stage not in (0, 1, 2):
+            raise ValueError("diagnostic_stage must be 0 (both), 1 (FC1), or 2 (FC2)")
+        self.scheduler_single_group = scheduler_single_group
+        if scheduler_single_group and not scheduler_lookup:
+            raise ValueError("Single-group diagnostic requires lookup scheduling")
+        self.scheduler_lookup = scheduler_lookup
+        if scheduler_lookup and (load_balance_mode != "static" or
+                tuple(cluster_shape_mnk) != (1, 1, 1) or use_2cta_instrs or
+                static_expert_shape is None or static_expert_shape[0] != 128 or
+                fc2_tile_n is not None):
+            raise ValueError("Lookup scheduler requires static 128-expert, single-CTA geometry")
+        self.diagnostic_clc_tiles = diagnostic_clc_tiles
+        if load_balance_mode in ("clc", "fc2_static", "fc2_grid") and (
+            diagnostic_stage != 2 or tuple(cluster_shape_mnk) != (1, 1, 1)
+            or use_2cta_instrs or fc2_tile_n is not None
+            or not 0 < diagnostic_clc_tiles <= 65535
+            or fc2_in_kernel_topk_reduce or token_back_by_dispatch
+        ):
+            raise ValueError("CLC is restricted to all-ready, single-CTA FC2 with an exact diagnostic grid")
+        self.diagnostic_stage = diagnostic_stage
+        self.fc2_tile_n = mma_tiler_mnk[1] if fc2_tile_n is None else fc2_tile_n
+        self.mixed_fc2_geometry = self.fc2_tile_n != mma_tiler_mnk[1]
+        if self.mixed_fc2_geometry and (
+            tuple(mma_tiler_mnk) != (128, 256, 128)
+            or tuple(cluster_shape_mnk) != (1, 1, 1)
+            or use_2cta_instrs or self.fc2_tile_n != 128
+            or fc2_in_kernel_topk_reduce or token_back_by_dispatch
+        ):
+            raise ValueError("Mixed FC2 geometry requires M128/N256 FC1 and N128 FC2")
+        self.fc2_mma_tiler = (mma_tiler_mnk[0], self.fc2_tile_n, mma_tiler_mnk[2])
+        if fc2_acc_release not in ("auto", "late", "disjoint_late", "disjoint_early"):
+            raise ValueError("Invalid FC2 accumulator release policy")
+        self.fc2_acc_release = fc2_acc_release
+        self.fc2_disjoint_acc = fc2_acc_release.startswith("disjoint_")
+        if self.fc2_disjoint_acc and not self.mixed_fc2_geometry:
+            raise ValueError("Disjoint FC2 accumulators require N256 FC1 / N128 FC2")
+        self.fc2_late_release = (
+            self.mixed_fc2_geometry if fc2_acc_release == "auto"
+            else fc2_acc_release in ("late", "disjoint_late")
+        )
         # v1 only the lean static-sched path; dyn_2d3d 12-warp path
         # (empty + drain_aux warps) is future work.
         if not force_static_sched:
@@ -121,7 +169,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                 f"v1 fused fc12 only supports scenario='2Dx3D' (forward); "
                 f"got {scenario!r}."
             )
-        if load_balance_mode not in ("static", "atomic_counter"):
+        if load_balance_mode not in ("static", "atomic_counter", "clc", "fc2_static", "fc2_grid"):
             raise ValueError(
                 f"load_balance_mode must be 'static' or 'atomic_counter'; "
                 f"got {load_balance_mode!r}."
@@ -131,7 +179,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         # Admit only matched MMA/cluster pairs: scheduler readiness counters
         # index token tiles using the same M as the dispatch path.
         geometry = (tuple(mma_tiler_mnk), tuple(cluster_shape_mnk), use_2cta_instrs)
-        if geometry not in (
+        diagnostic_fc2_geometry = (diagnostic_stage == 2 and geometry ==
+                                   ((128, 128, 128), (1, 1, 1), False))
+        if not diagnostic_fc2_geometry and geometry not in (
             ((256, 256, 128), (2, 1, 1), True),
             ((128, 256, 128), (1, 1, 1), False),
         ):
@@ -303,11 +353,20 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         )
         return tiled_mma, tiled_mma_sfb
 
+    def _create_fc2_mma(self):
+        return sm100_utils.make_blockscaled_trivial_tiled_mma(
+            self.a_dtype, self.b_dtype, self.a_major_mode, self.b_major_mode,
+            self.sf_dtype, self.sf_vec_size, self.cta_group,
+            (self.mma_tiler[0], self.fc2_tile_n),
+        )
+
     def _setup_attributes(self) -> None:
         """Set up MMA / cluster / tile shapes, SMEM layouts, stage counts.
 
         The fc12 path shares ``mma_tiler_mnk`` and SMEM layouts across phases.
         """
+        if (self.mixed_fc2_geometry or self.fc2_acc_release != "auto") and self.enable_token_comm:
+            raise NotImplementedError("Mixed FC2 geometry is lean-compute diagnostic only")
         if self.enable_token_comm:
             self.dispatch_warp_id = (8, 9, 10, 11)
             num_token_back_warps = (
@@ -397,7 +456,13 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             combine_format=getattr(self, "combine_format", None),
         )
         self.epilogue = GluMxfp8Epilogue(**_epi_common)
+        self.epilogue._fc2_tile_n = self.fc2_tile_n
+        self.epilogue._mixed_fc2_geometry = self.mixed_fc2_geometry
+        self.epilogue._fc2_late_release = self.fc2_late_release
+        self.epilogue._fc2_disjoint_acc = self.fc2_disjoint_acc
         # The epilogue is constructed here, not in the host constructor.
+        self.epilogue._packed_fc1_activation = getattr(self, "packed_fc1_activation", False)
+        self.epilogue._hardware_tanh = getattr(self, "hardware_tanh", False)
         if getattr(self, "debug_prequant", False):
             self.epilogue._debug_prequant_offset = self._local_offsets["debug_prequant"]
             self.epilogue._debug_prequant_width = self._local_region_by_name[
@@ -469,6 +534,22 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             self.sf_vec_size,
             self.num_b_stage,
         )
+        if self.mixed_fc2_geometry:
+            # Overlay the smaller FC2 stages on FC1 storage, preserving the full
+            # stage stride. Compacting that stride would alias live FC1 stages.
+            fc2_mma = self._create_fc2_mma()
+            fc2_b = sm100_utils.make_smem_layout_b(
+                fc2_mma, self.fc2_mma_tiler, self.b_dtype, self.num_b_stage)
+            self.fc2_b_smem_layout_staged = cute.make_composed_layout(
+                fc2_b.inner, 0, cute.make_layout(fc2_b.outer.shape,
+                    stride=(*fc2_b.outer.stride[:3], self.b_smem_layout_staged.outer.stride[3])))
+            fc2_sfb = blockscaled_utils.make_smem_layout_sfb(
+                fc2_mma, self.fc2_mma_tiler, self.sf_vec_size, self.num_b_stage)
+            self.fc2_sfb_smem_layout_staged = cute.make_layout(fc2_sfb.shape,
+                stride=(*fc2_sfb.stride[:3], self.sfb_smem_layout_staged.stride[3]))
+        else:
+            self.fc2_b_smem_layout_staged = self.b_smem_layout_staged
+            self.fc2_sfb_smem_layout_staged = self.sfb_smem_layout_staged
         self.d_smem_layout_staged = self.epilogue.staged_smem_layout(
             self.num_d_stage,
         )
@@ -490,6 +571,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         self.num_sf_tmem_cols = self.epilogue.num_sf_tmem_cols
         self.num_accumulator_tmem_cols = self.epilogue.num_accumulator_tmem_cols
         self.iter_acc_early_release_in_epilogue = self.epilogue.iter_acc_early_release
+        if self.fc2_disjoint_acc:
+            assert self.overlapping_accum and self.num_accumulator_tmem_cols == 480
+
 
         # TMA load bytes per stage (A + B + SFA + SFB).
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
@@ -510,6 +594,10 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_a_bytes = (a_copy_size + sfa_copy_size) * atom_thr_size
         self.num_tma_load_b_bytes = (b_copy_size + sfb_copy_size) * atom_thr_size
+        self.fc2_tma_load_b_bytes = (
+            cute.size_in_bytes(self.b_dtype, cute.slice_(self.fc2_b_smem_layout_staged, (None, None, None, 0)))
+            + cute.size_in_bytes(self.sf_dtype, cute.slice_(self.fc2_sfb_smem_layout_staged, (None, None, None, 0)))
+        ) * atom_thr_size
 
     def _smem_misc_budget_bytes(self) -> int:
         """Per-CTA SMEM reserved outside the AB-stage pipeline.
@@ -587,20 +675,26 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             num_b_stage = num_b_stage + 1
             unused_smem = unused_smem - b_bytes_per_stage
 
-        from .pipeline_config import reduce_ab_stages
+        from .pipeline_config import reduce_ab_stages, reduce_one_pipeline
         import json
 
         original_a, original_b = num_a_stage, num_b_stage
         num_a_stage, num_b_stage = reduce_ab_stages(
             original_a, original_b, self.ab_stage_reduction
         )
-        released = self.ab_stage_reduction * ab_bytes_per_stage
+        side = getattr(self, "pipeline_reduce_side", "none")
+        num_a_stage, num_b_stage = reduce_one_pipeline(num_a_stage, num_b_stage, side)
+        released = ((original_a - num_a_stage) * (ab_bytes_per_stage - b_bytes_per_stage)
+                    + (original_b - num_b_stage) * b_bytes_per_stage)
+        if released < 0:
+            raise ValueError("Pipeline experiment must not exceed original SMEM budget")
         print(
             json.dumps(
                 dict(
                     stage="nt4_mxfp8_pipeline_resources",
                     mma_tiler_mnk=mma_tiler_mnk,
                     reduction=self.ab_stage_reduction,
+                    independent_reduction=side,
                     original_a_stages=original_a,
                     original_b_stages=original_b,
                     a_stages=num_a_stage,
@@ -817,6 +911,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         fc1_c: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch the fused fc1+fc2 GLU MXFP8 kernel."""
+
+        if cutlass.const_expr(self.diagnostic_stage != 0 and token_comm_args is not None):
+            raise ValueError("Stage isolation is standalone-only; no communication or E2E")
 
         # Bind data-tensor shapes to codegen-time expert dims when requested.
         # Strides, token rows, and SF tensors stay runtime-dynamic because they
@@ -1159,6 +1256,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             ),
         )
 
+        fc2_mma = self._create_fc2_mma()
+        fc2_b_layout = cute.slice_(self.fc2_b_smem_layout_staged, (None, None, None, 0))
+        fc2_sfb_layout = cute.slice_(self.fc2_sfb_smem_layout_staged, (None, None, None, 0))
         # ── fc2 TMA atoms: fc1_output → A-side (M=tokens), fc2_weight → B-side (N=hidden) ──
         # Non-swap-AB fc2: activation (fc1_output) is GEMM-A (M=tokens),
         # weight (fc2_weight) is GEMM-B (N=hidden). Same SMEM layouts as fc1.
@@ -1176,9 +1276,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         tma_atom_fc2_weight, tma_tensor_fc2_weight = cute.nvgpu.make_tiled_tma_atom_B(
             b_op,
             fc2_weight_gemm,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
+            fc2_b_layout,
+            self.fc2_mma_tiler,
+            fc2_mma,
             self.cluster_layout_vmnk.shape,
         )
         tma_atom_fc2_activation_sf, tma_tensor_fc2_activation_sf = (
@@ -1196,9 +1296,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             cute.nvgpu.make_tiled_tma_atom_B(
                 sfb_op,
                 fc2_weight_sf_gemm,
-                sfb_smem_layout,
-                self.mma_tiler_sfb,
-                tiled_mma_sfb,
+                fc2_sfb_layout,
+                self.fc2_mma_tiler if self.mixed_fc2_geometry else self.mma_tiler_sfb,
+                fc2_mma if self.mixed_fc2_geometry else tiled_mma_sfb,
                 self.cluster_layout_sfb_vmnk.shape,
                 internal_type=cutlass.Uint64,
             )
@@ -1245,6 +1345,9 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                 f"{'set' if expert_token_sizes is not None else 'None'}."
             )
 
+        if cutlass.const_expr(self.load_balance_mode in ("clc", "fc2_static", "fc2_grid")):
+            if cutlass.const_expr(self.enable_token_comm or offs is None):
+                raise ValueError("Diagnostic FC2 scheduler requires local, all-ready prefix-sum input")
         sched_params = MoEFusedFc12SchedulerParams(
             scenario=self.scenario,
             expert_shape=(expert_cnt, intermediate_gateup, hidden_dim),
@@ -1253,7 +1356,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             group_hint=self.group_hint,
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,
-            load_balance_mode=self.load_balance_mode,
+            load_balance_mode=("static" if self.load_balance_mode in ("clc", "fc2_static", "fc2_grid") else self.load_balance_mode),
             load_balance_counter_ptr=load_balance_counter_ptr,
             override_num_stages=self.num_sched_stages,
             is_swap_ab=False,
@@ -1261,6 +1364,13 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             expert_token_sizes=expert_token_sizes,
         )
         grid = sched_params.get_grid_shape(max_active_clusters)
+        if cutlass.const_expr(self.load_balance_mode in ("clc", "fc2_grid")):
+            if cutlass.const_expr(self.enable_token_comm):
+                raise ValueError("Diagnostic CLC cannot run the communicating kernel")
+            grid = (1, 1, self.diagnostic_clc_tiles)
+        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+            assert grid[0] * grid[1] * grid[2] <= 1024, "internal timing CTA capacity exceeded"
+            assert self.threads_per_cta <= 512, "internal timing warp capacity exceeded"
 
         self.kernel(
             tiled_mma,
@@ -1311,6 +1421,8 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.d_smem_layout_staged,
+            self.fc2_b_smem_layout_staged,
+            self.fc2_sfb_smem_layout_staged,
             self.c_smem_layout_staged,
             tma_atom_c,
             tma_tensor_c,
@@ -1375,6 +1487,8 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         d_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
+        fc2_b_smem_layout_staged: cute.ComposedLayout,
+        fc2_sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Optional[Union[cute.Layout, cute.ComposedLayout]] = None,
         tma_atom_c: Optional[cute.CopyAtom] = None,
         tma_tensor_c: Optional[cute.Tensor] = None,
@@ -1435,6 +1549,10 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
 
         # SharedStorage.
         SchedCls = sched_params.get_scheduler_type()
+        if cutlass.const_expr(self.scheduler_lookup):
+            SchedCls = GroupedLookupScheduler
+        if cutlass.const_expr(self.load_balance_mode in ("clc", "fc2_static", "fc2_grid")):
+            SchedCls = Fc2ClcScheduler
         SchedStorage = SchedCls.make_storage_struct(
             sched_params, ext, num_drain_warps=0
         )
@@ -1485,7 +1603,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             num_stages=self.num_b_stage,
             producer_group=b_pipeline_producer_group,
             consumer_group=b_pipeline_consumer_group,
-            tx_count=self.num_tma_load_b_bytes,
+            tx_count=self.fc2_tma_load_b_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         ).make_participants()
@@ -1529,14 +1647,30 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                 *self.epilogue_warp_id,
             )
         )
-        scheduler = SchedCls.create(
-            sched_params,
-            cute.arch.block_idx(),
-            cute.arch.grid_dim(),
-            sched_storage=storage.sched_storage,
-            num_consumer_threads=num_sched_consumer_threads,
-            ext=ext,
-        )
+        if cutlass.const_expr(self.load_balance_mode in ("clc", "fc2_static", "fc2_grid")):
+            scheduler = SchedCls.create(
+                sched_params, cute.arch.block_idx(), cute.arch.grid_dim(),
+                sched_storage=storage.sched_storage,
+                num_consumer_threads=num_sched_consumer_threads, ext=ext,
+                use_clc=self.load_balance_mode == "clc",
+                num_tiles=self.diagnostic_clc_tiles)
+        elif cutlass.const_expr(self.scheduler_lookup):
+            scheduler = SchedCls.create(
+                sched_params, cute.arch.block_idx(), cute.arch.grid_dim(),
+                sched_storage=storage.sched_storage,
+                num_consumer_threads=num_sched_consumer_threads, ext=ext,
+                single_group=self.scheduler_single_group)
+        else:
+            scheduler = SchedCls.create(
+                sched_params,
+                cute.arch.block_idx(),
+                cute.arch.grid_dim(),
+                sched_storage=storage.sched_storage,
+                num_consumer_threads=num_sched_consumer_threads,
+                ext=ext,
+            )
+        if cutlass.const_expr(self.mixed_fc2_geometry):
+            scheduler._num_fc2_hidden_blocks = (sched_params.hidden + self.fc2_tile_n - 1) // self.fc2_tile_n
         sched_consumer = scheduler.make_consumer()
 
         # Issue the first scheduler claim before cluster init wait so the
@@ -1581,12 +1715,15 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             byte_alignment=128,
         )
 
+        fc2_mma = self._create_fc2_mma()
+        sB2 = cute.make_tensor(sB.iterator, fc2_b_smem_layout_staged.outer)
+        sSFB2 = cute.make_tensor(sSFB.iterator, fc2_sfb_smem_layout_staged)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
         # acc_fake layout: (MMA, MMA_M, MMA_N, STAGE).  Under
         # ``overlapping_accum`` the two acc buffers share TMEM with SF
         # columns; we shrink the stage stride so the second buffer
-        # starts at ``(256 - num_sf_tmem_cols)`` cols instead of 256.
+        # starts at ``(tile_n - num_sf_tmem_cols)`` cols instead of tile_n.
         acc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
         if cutlass.const_expr(self.overlapping_accum):
             acc_fake = cute.make_tensor(
@@ -1597,7 +1734,7 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                         acc_fake.stride[0],
                         acc_fake.stride[1],
                         acc_fake.stride[2],
-                        (256 - self.num_sf_tmem_cols) * acc_fake.stride[0][1],
+                        (self.mma_tiler[1] - self.num_sf_tmem_cols) * acc_fake.stride[0][1],
                     ),
                 ),
             )
@@ -1635,8 +1772,15 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                 )
             scheduler.gen_next_work()
             while scheduler.current_work.is_valid_tile:
-                ext.prefetch_for_expert(scheduler.current_work.expert_idx)
-                scheduler.publish_work()
+                # Diagnostic stage filtering preserves the original work enumeration.
+                # Skipped stages execute no MMA/epilogue; enumeration overhead remains.
+                if cutlass.const_expr(self.diagnostic_stage == 0):
+                    ext.prefetch_for_expert(scheduler.current_work.expert_idx)
+                    scheduler.publish_work()
+                else:
+                    if scheduler.current_work.phase == cutlass.Int32(self.diagnostic_stage):
+                        ext.prefetch_for_expert(scheduler.current_work.expert_idx)
+                        scheduler.publish_work()
                 scheduler.gen_next_work()
             # Sentinel publish (current_work is already invalid here).
             scheduler.publish_work()
@@ -1652,6 +1796,11 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
 
         # ── TMA-A warp (warp 5) ─────────────────────────────────────────────
         if warp_idx == self.tma_a_warp_id:
+            if cutlass.const_expr(getattr(self, "sparse_timing", False)):
+                sparse_seen = cutlass.Int32(0)
+                sparse_begin = cutlass.Int64(0)
+                sparse_ready = cutlass.Int64(0)
+                self.internal_store(token_comm_args, warp_idx, 0, cutlass.Int64(0))
             _iket_active = tidx == cutlass.Int32(160)
             a_full_mcast_mask = None
             sfa_full_mcast_mask = None
@@ -1681,6 +1830,21 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
 
             thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
 
+            if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                self.internal_stamp(token_comm_args, warp_idx, 18)
+                ready_ns = cutlass.Int64(0)
+                stage_acquire_ns = cutlass.Int64(0)
+                stage_issue_ns = cutlass.Int64(0)
+                stage_tiles = cutlass.Int64(0)
+                descriptor_ns = cutlass.Int64(0)
+                first_slot_ns = cutlass.Int64(0)
+                later_slot_ns = cutlass.Int64(0)
+                first_issue_ns = cutlass.Int64(0)
+                later_issue_ns = cutlass.Int64(0)
+                spin_ns = cutlass.Int64(0)
+                fence_ns = cutlass.Int64(0)
+                for slot in cutlass.range_constexpr(33, 40):
+                    self.internal_store(token_comm_args, warp_idx, slot, cutlass.Int64(0))
             work_tile_info = sched_consumer.consume_work()
 
             while work_tile_info.is_valid_tile:
@@ -1792,6 +1956,16 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                     # writes (from generic proxy) are visible to the TMA async proxy load.
                     if _iket_active:
                         iket.range_push("tma_token_fc2_a_wait")
+                    if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                        ready_begin = self.internal_now()
+                        if stage_tiles == 0:
+                            self.internal_store(token_comm_args, warp_idx, 33, ready_begin)
+                            self.internal_store(token_comm_args, warp_idx, 37, counter_slot + 1)
+                            self.internal_store(token_comm_args, warp_idx, 38, work_tile_info.expert_idx + 1)
+                            self.internal_store(token_comm_args, warp_idx, 39, work_tile_info.tile_m_idx + 1)
+                    if cutlass.const_expr(getattr(self, "sparse_timing", False)):
+                        if sparse_seen == 0:
+                            sparse_begin = self.internal_now()
                     spin_wait(
                         counter_ptr,
                         lambda v: v >= fc2_spin_threshold,
@@ -1799,12 +1973,26 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                     )
                     if _iket_active:
                         iket.range_pop()
+                    if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                        spin_end = self.internal_now()
+                        spin_ns += spin_end - ready_begin
                     cute.arch.load(
                         counter_ptr, counter_ptr.dtype, sem="acquire", scope="gpu"
                     )
                     cute.arch.fence_proxy("async")
                     cute.arch.fence_proxy("async.global")
+                    if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                        ready_end = self.internal_now()
+                        ready_ns += ready_end - ready_begin
+                        fence_ns += ready_end - spin_end
+                        if stage_tiles == 0:
+                            self.internal_store(token_comm_args, warp_idx, 34, ready_end)
+                        stage_begin = self.internal_now()
+                        tile_acquire_ns = cutlass.Int64(0)
 
+                    if cutlass.const_expr(getattr(self, "sparse_timing", False)):
+                        if sparse_seen == 0:
+                            sparse_ready = self.internal_now()
                     k_tile_cnt = k_tile_cnt_fc2
                     real_a, desc_ptr_a = ext.get_gmem_tensor(
                         "fc2_activation",
@@ -1857,13 +2045,42 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                     tAgSFA_slice = tAgSFA[(None, mma_tile_m, None, 0)]
 
                     a_producer.reset()
+                    if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                        descriptor_ns += self.internal_now() - stage_begin
+                        slot_probe_begin = self.internal_now()
                     peek_a_empty_status = a_producer.try_acquire()
+                    if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                        probe_ns = self.internal_now() - slot_probe_begin
+                        tile_acquire_ns += probe_ns
+                        first_slot_ns += probe_ns
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            acquire_begin = self.internal_now()
                         handle = a_producer.acquire_and_advance(peek_a_empty_status)
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            acquire_ns = self.internal_now() - acquire_begin
+                            tile_acquire_ns += acquire_ns
+                            if handle.count == 0:
+                                first_slot_ns += acquire_ns
+                            else:
+                                later_slot_ns += acquire_ns
                         peek_a_empty_status = cutlass.Boolean(1)
-                        if handle.count + 1 < k_tile_cnt:
-                            peek_a_empty_status = a_producer.try_acquire()
+                        # Candidate issues the current transfer before probing the
+                        # next slot. Keep all acquire/release operations intact.
+                        if cutlass.const_expr(not getattr(self, "fc2_probe_after_issue", False)):
+                            if handle.count + 1 < k_tile_cnt:
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    slot_probe_begin = self.internal_now()
+                                peek_a_empty_status = a_producer.try_acquire()
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    probe_ns = self.internal_now() - slot_probe_begin
+                                    tile_acquire_ns += probe_ns
+                                    later_slot_ns += probe_ns
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            issue_begin = self.internal_now()
+                            if stage_tiles == 0 and handle.count == 0:
+                                self.internal_store(token_comm_args, warp_idx, 35, issue_begin)
                         cute.copy(
                             tma_atom_fc2_activation,
                             tAgA_slice[(None, handle.count)],
@@ -1880,12 +2097,58 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                             tma_desc_ptr=desc_ptr_sfa,
                             mcast_mask=sfa_full_mcast_mask,
                         )
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            issue_end = self.internal_now()
+                            if handle.count == 0:
+                                first_issue_ns += issue_end - issue_begin
+                            else:
+                                later_issue_ns += issue_end - issue_begin
+                            if stage_tiles == 0:
+                                self.internal_store(token_comm_args, warp_idx, 36, issue_end)
+
+                        if cutlass.const_expr(getattr(self, "fc2_probe_after_issue", False)):
+                            if handle.count + 1 < k_tile_cnt:
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    slot_probe_begin = self.internal_now()
+                                peek_a_empty_status = a_producer.try_acquire()
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    probe_ns = self.internal_now() - slot_probe_begin
+                                    tile_acquire_ns += probe_ns
+                                    later_slot_ns += probe_ns
+
+                    if cutlass.const_expr(getattr(self, "sparse_timing", False)):
+                        if sparse_seen == 0:
+                            sparse_end = self.internal_now()
+                            self.internal_store(token_comm_args, warp_idx, 0, sparse_begin)
+                            self.internal_store(token_comm_args, warp_idx, 1, sparse_ready)
+                            self.internal_store(token_comm_args, warp_idx, 2, sparse_end)
+                            self.internal_store(token_comm_args, warp_idx, 3, work_tile_info.expert_idx + 1)
+                            self.internal_store(token_comm_args, warp_idx, 4, work_tile_info.tile_m_idx + 1)
+                            self.internal_store(token_comm_args, warp_idx, 5, work_tile_info.tile_n_idx + 1)
+                        sparse_seen += 1
+                    if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                        stage_acquire_ns += tile_acquire_ns
+                        stage_issue_ns += self.internal_now() - stage_begin - tile_acquire_ns
+                        stage_tiles += 1
 
                 if _iket_active:
                     iket.range_pop()
                 work_tile_info = sched_consumer.consume_work()
 
             a_producer.tail()
+            if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                self.internal_stamp(token_comm_args, warp_idx, 19)
+                self.internal_store(token_comm_args, warp_idx, 20, ready_ns)
+                self.internal_store(token_comm_args, warp_idx, 21, stage_acquire_ns)
+                self.internal_store(token_comm_args, warp_idx, 22, stage_issue_ns)
+                self.internal_store(token_comm_args, warp_idx, 23, stage_tiles)
+                self.internal_store(token_comm_args, warp_idx, 26, descriptor_ns)
+                self.internal_store(token_comm_args, warp_idx, 27, first_slot_ns)
+                self.internal_store(token_comm_args, warp_idx, 28, later_slot_ns)
+                self.internal_store(token_comm_args, warp_idx, 29, first_issue_ns)
+                self.internal_store(token_comm_args, warp_idx, 30, later_issue_ns)
+                self.internal_store(token_comm_args, warp_idx, 31, spin_ns)
+                self.internal_store(token_comm_args, warp_idx, 32, fence_ns)
 
         # ── TMA-B warp (warp 6) ─────────────────────────────────────────────
         if warp_idx == self.tma_b_warp_id:
@@ -1992,6 +2255,10 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         handle = b_producer.acquire_and_advance(peek_b_empty_status)
+                        if cutlass.const_expr(self.mixed_fc2_geometry):
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_expect_tx(handle.barrier,
+                                    self.num_tma_load_b_bytes - self.fc2_tma_load_b_bytes)
                         peek_b_empty_status = cutlass.Boolean(1)
                         if handle.count + 1 < k_tile_cnt:
                             peek_b_empty_status = b_producer.try_acquire()
@@ -2030,29 +2297,29 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
 
                     gB_nkl = cute.local_tile(
                         real_b,
-                        cute.slice_(self.mma_tiler, (0, None, None)),
+                        cute.slice_(self.fc2_mma_tiler, (0, None, None)),
                         (None, None, None),
                     )
                     gSFB_nkl = cute.local_tile(
                         real_sfb,
-                        cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+                        cute.slice_(self.fc2_mma_tiler if self.mixed_fc2_geometry else self.mma_tiler_sfb, (0, None, None)),
                         (None, None, None),
                     )
-                    tCgB = thr_mma.partition_B(gB_nkl)
-                    tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
+                    tCgB = fc2_mma.get_slice(mma_tile_coord_v).partition_B(gB_nkl)
+                    tCgSFB = (fc2_mma.get_slice(mma_tile_coord_v) if cutlass.const_expr(self.mixed_fc2_geometry) else thr_mma_sfb).partition_B(gSFB_nkl)
 
                     tBsB, tBgB = cpasync.tma_partition(
                         tma_atom_fc2_weight,
                         block_in_cluster_coord_vmnk[1],
                         b_cta_layout,
-                        cute.group_modes(sB, 0, 3),
+                        cute.group_modes(sB2, 0, 3),
                         cute.group_modes(tCgB, 0, 3),
                     )
                     tBsSFB, tBgSFB = cpasync.tma_partition(
                         tma_atom_fc2_weight_sf,
                         block_in_cluster_coord_sfb_vmnk[1],
                         sfb_cta_layout,
-                        cute.group_modes(sSFB, 0, 3),
+                        cute.group_modes(sSFB2, 0, 3),
                         cute.group_modes(tCgSFB, 0, 3),
                     )
                     tBsSFB = cute.filter_zeros(tBsSFB)
@@ -2108,6 +2375,8 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             acc_base = cute.make_tensor(acc_tmem_ptr, acc_fake.layout)
+            fc2_acc_fake = fc2_mma.make_fragment_C(fc2_mma.partition_shape_C(self.fc2_mma_tiler[:2]))
+            tCrB2 = fc2_mma.make_fragment_B(sB2)
 
             # SFA TMEM tensor (placed after the acc cols).
             sfa_tmem_ptr = cute.recast_ptr(
@@ -2146,6 +2415,16 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                 tCtSFB_compact_s2t,
             ) = self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
 
+            fc2_sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
+                fc2_mma, self.fc2_mma_tiler, self.sf_vec_size,
+                cute.slice_(fc2_sfb_smem_layout_staged, (None, None, None, 0)))
+            tCtSFB2 = cute.make_tensor(sfb_tmem_ptr, fc2_sfb_tmem_layout)
+            fc2_copy_sfb, fc2_src_sfb, fc2_dst_sfb = self.mainloop_s2t_copy_and_partition(sSFB2, tCtSFB2)
+
+            if cutlass.const_expr(getattr(self, "sparse_timing", False)):
+                sparse_seen = cutlass.Int32(0)
+                sparse_begin = cutlass.Int64(0)
+                self.internal_store(token_comm_args, warp_idx, 0, cutlass.Int64(0))
             acc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_acc_pipeline_stages
             )
@@ -2153,7 +2432,26 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
             # K-tile counts ``k_tile_cnt_fc1`` / ``k_tile_cnt_fc2`` come
             # from the enclosing scope (computed once before the TMA warps).
 
+            if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                self.internal_stamp(token_comm_args, warp_idx, 6)
+                sched_ns = cutlass.Int64(0)
+                tail_ns = cutlass.Int64(0)
+                fc1_acc_ns = cutlass.Int64(0)
+                fc1_ab_ns = cutlass.Int64(0)
+                fc1_issue_ns = cutlass.Int64(0)
+                fc1_tiles = cutlass.Int64(0)
+                fc2_acc_ns = cutlass.Int64(0)
+                fc2_ab_ns = cutlass.Int64(0)
+                fc2_issue_ns = cutlass.Int64(0)
+                fc2_tiles = cutlass.Int64(0)
+                fc2_a_ns = cutlass.Int64(0)
+                fc2_b_ns = cutlass.Int64(0)
+
+            if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                sched_begin = self.internal_now()
             work_tile_info = sched_consumer.consume_work()
+            if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                sched_ns += self.internal_now() - sched_begin
 
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
@@ -2177,7 +2475,14 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
 
                 if is_leader_cta:
                     tCtAcc = acc_base[(None, None, None, acc_stage_index)]
+                    if cutlass.const_expr(getattr(self, "sparse_timing", False)):
+                        if not is_phase_linear1 and sparse_seen == 0:
+                            sparse_begin = self.internal_now()
 
+                    if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                        tile_begin = self.internal_now()
+                        tile_ab_ns = cutlass.Int64(0)
+                        acc_ns = cutlass.Int64(0)
                     if _iket_active:
                         iket.range_push("mma_ab_wait")
                     a_consumer.reset()
@@ -2185,21 +2490,58 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                     peek_a_full_status = cutlass.Boolean(1)
                     peek_b_full_status = cutlass.Boolean(1)
                     if k_tile_cnt > 0:
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            probe_begin = self.internal_now()
                         peek_a_full_status = a_consumer.try_wait()
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            probe_a_end = self.internal_now()
                         peek_b_full_status = b_consumer.try_wait()
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            probe_b_end = self.internal_now()
+                            tile_ab_ns += probe_b_end - probe_begin
+                            if not is_phase_linear1:
+                                fc2_a_ns += probe_a_end - probe_begin
+                                fc2_b_ns += probe_b_end - probe_a_end
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            acc_begin = self.internal_now()
                         acc_pipeline.producer_acquire(acc_producer_state)
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            acc_ns = self.internal_now() - acc_begin
                     if _iket_active:
                         iket.range_pop()
 
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            ab_begin = self.internal_now()
                         handle_a = a_consumer.wait_and_advance(peek_a_full_status)
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            a_end = self.internal_now()
                         handle_b = b_consumer.wait_and_advance(peek_b_full_status)
+                        if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                            b_end = self.internal_now()
+                            tile_ab_ns += b_end - ab_begin
+                            if not is_phase_linear1:
+                                fc2_a_ns += a_end - ab_begin
+                                fc2_b_ns += b_end - a_end
                         peek_a_full_status = cutlass.Boolean(1)
                         peek_b_full_status = cutlass.Boolean(1)
-                        if handle_a.count + 1 < k_tile_cnt:
-                            peek_a_full_status = a_consumer.try_wait()
-                            peek_b_full_status = b_consumer.try_wait()
+                        # Experiment: avoid probing the next stage before issuing
+                        # the ready tile. The default preserves the original schedule.
+                        if cutlass.const_expr(not getattr(self, "lookahead_after_mma", False)):
+                            if handle_a.count + 1 < k_tile_cnt:
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    probe_begin = self.internal_now()
+                                peek_a_full_status = a_consumer.try_wait()
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    probe_a_end = self.internal_now()
+                                peek_b_full_status = b_consumer.try_wait()
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    probe_b_end = self.internal_now()
+                                    tile_ab_ns += probe_b_end - probe_begin
+                                    if not is_phase_linear1:
+                                        fc2_a_ns += probe_a_end - probe_begin
+                                        fc2_b_ns += probe_b_end - probe_a_end
 
                         cute.copy(
                             tiled_copy_s2t_sfa,
@@ -2208,36 +2550,126 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                             ],
                             tCtSFA_compact_s2t,
                         )
-                        cute.copy(
-                            tiled_copy_s2t_sfb,
-                            tCsSFB_compact_s2t[
-                                (None, None, None, None, handle_b.index)
-                            ],
-                            tCtSFB_compact_s2t,
-                        )
+                        if cutlass.const_expr(self.mixed_fc2_geometry):
+                            if is_phase_linear1:
+                                cute.copy(
+                                    tiled_copy_s2t_sfb,
+                                    tCsSFB_compact_s2t[
+                                        (None, None, None, None, handle_b.index)
+                                    ],
+                                    tCtSFB_compact_s2t,
+                                )
 
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                        cute.gemm(
-                            tiled_mma,
-                            tCtAcc,
-                            [tCrA[(None, None, None, handle_a.index)], tCtSFA],
-                            [tCrB[(None, None, None, handle_b.index)], tCtSFB],
-                            tCtAcc,
-                        )
+                                tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                                cute.gemm(
+                                    tiled_mma,
+                                    tCtAcc,
+                                    [tCrA[(None, None, None, handle_a.index)], tCtSFA],
+                                    [tCrB[(None, None, None, handle_b.index)], tCtSFB],
+                                    tCtAcc,
+                                )
+                            else:
+                                cute.copy(fc2_copy_sfb,
+                                    fc2_src_sfb[(None, None, None, None, handle_b.index)], fc2_dst_sfb)
+                                fc2_acc_ptr = tCtAcc.iterator
+                                if cutlass.const_expr(self.fc2_disjoint_acc):
+                                    # FC1 stages occupy [0,256), [224,480).
+                                    # FC2 occupies [0,128), [352,480), disjoint
+                                    # from either phase's opposite-parity stage.
+                                    fc2_acc_ptr = fc2_acc_ptr + cute.assume(acc_stage_index * 128, divby=16)
+                                fc2_acc = cute.make_tensor(fc2_acc_ptr, fc2_acc_fake.layout)
+                                fc2_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                                cute.gemm(fc2_mma, fc2_acc,
+                                    [tCrA[(None, None, None, handle_a.index)], tCtSFA],
+                                    [tCrB2[(None, None, None, handle_b.index)], tCtSFB2], fc2_acc)
+                        else:
+                            cute.copy(
+                                tiled_copy_s2t_sfb,
+                                tCsSFB_compact_s2t[
+                                    (None, None, None, None, handle_b.index)
+                                ],
+                                tCtSFB_compact_s2t,
+                            )
+
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                [tCrA[(None, None, None, handle_a.index)], tCtSFA],
+                                [tCrB[(None, None, None, handle_b.index)], tCtSFB],
+                                tCtAcc,
+                            )
                         handle_a.release()
                         handle_b.release()
+                        if cutlass.const_expr(getattr(self, "lookahead_after_mma", False)):
+                            if handle_a.count + 1 < k_tile_cnt:
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    probe_begin = self.internal_now()
+                                peek_a_full_status = a_consumer.try_wait()
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    probe_a_end = self.internal_now()
+                                peek_b_full_status = b_consumer.try_wait()
+                                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                                    probe_b_end = self.internal_now()
+                                    tile_ab_ns += probe_b_end - probe_begin
+                                    if not is_phase_linear1:
+                                        fc2_a_ns += probe_a_end - probe_begin
+                                        fc2_b_ns += probe_b_end - probe_a_end
 
                     if k_tile_cnt > 0:
                         acc_pipeline.producer_commit(acc_producer_state)
+                    if cutlass.const_expr(getattr(self, "sparse_timing", False)):
+                        if not is_phase_linear1:
+                            if sparse_seen == 0:
+                                sparse_end = self.internal_now()
+                                self.internal_store(token_comm_args, warp_idx, 0, sparse_begin)
+                                self.internal_store(token_comm_args, warp_idx, 1, sparse_end)
+                                self.internal_store(token_comm_args, warp_idx, 3, work_tile_info.expert_idx + 1)
+                                self.internal_store(token_comm_args, warp_idx, 4, work_tile_info.tile_m_idx + 1)
+                                self.internal_store(token_comm_args, warp_idx, 5, work_tile_info.tile_n_idx + 1)
+                            sparse_seen += 1
+                    if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                        issue_ns = self.internal_now() - tile_begin - acc_ns - tile_ab_ns
+                        if is_phase_linear1:
+                            fc1_acc_ns += acc_ns
+                            fc1_ab_ns += tile_ab_ns
+                            fc1_issue_ns += issue_ns
+                            fc1_tiles += 1
+                        else:
+                            fc2_acc_ns += acc_ns
+                            fc2_ab_ns += tile_ab_ns
+                            fc2_issue_ns += issue_ns
+                            fc2_tiles += 1
                 if k_tile_cnt > 0:
                     acc_producer_state.advance()
 
                 if _iket_active:
                     iket.range_pop()
 
+                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                    sched_begin = self.internal_now()
                 work_tile_info = sched_consumer.consume_work()
+                if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                    sched_ns += self.internal_now() - sched_begin
 
+            if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                tail_begin = self.internal_now()
             acc_pipeline.producer_tail(acc_producer_state)
+            if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                tail_ns = self.internal_now() - tail_begin
+                self.internal_stamp(token_comm_args, warp_idx, 7)
+                self.internal_store(token_comm_args, warp_idx, 8, sched_ns)
+                self.internal_store(token_comm_args, warp_idx, 9, tail_ns)
+                self.internal_store(token_comm_args, warp_idx, 10, fc1_acc_ns)
+                self.internal_store(token_comm_args, warp_idx, 11, fc1_ab_ns)
+                self.internal_store(token_comm_args, warp_idx, 12, fc1_issue_ns)
+                self.internal_store(token_comm_args, warp_idx, 13, fc1_tiles)
+                self.internal_store(token_comm_args, warp_idx, 14, fc2_acc_ns)
+                self.internal_store(token_comm_args, warp_idx, 15, fc2_ab_ns)
+                self.internal_store(token_comm_args, warp_idx, 16, fc2_issue_ns)
+                self.internal_store(token_comm_args, warp_idx, 17, fc2_tiles)
+                self.internal_store(token_comm_args, warp_idx, 24, fc2_a_ns)
+                self.internal_store(token_comm_args, warp_idx, 25, fc2_b_ns)
 
         # ── sD SMEM (fc1 output staging; fc2 doesn't use it) ──
         # Always allocated for correct typing in const_expr-gated TMA dead branches.
@@ -2313,12 +2745,17 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel:
                 norm_const=cutlass.Float32(1.0),
             )
 
+            if cutlass.const_expr(getattr(self, "internal_timing", False)):
+                _run_kwargs["turnover_ticks"] = self.internal_view(token_comm_args)
+
             # MegaMoE: pass token_comm_args only when it is a real bundle (not
             # None).  Passing Python None explicitly to @cute.jit methods
             # triggers a CuteDSL codegen issue; const_expr dispatch avoids any
             # None-as-JIT-argument path.
             if cutlass.const_expr(token_comm_args is not None):
+                self.internal_stamp(token_comm_args, warp_idx, 2)
                 self.epilogue.run(**_run_kwargs, token_comm_args=token_comm_args)
+                self.internal_stamp(token_comm_args, warp_idx, 3)
             else:
                 self.epilogue.run(**_run_kwargs)
 

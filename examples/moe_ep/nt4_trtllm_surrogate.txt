@@ -1,0 +1,61 @@
+NT4 TRTLLM-gen MXFP8 Relu2 surrogate
+
+Purpose: test local expert-compute headroom and shortcut overlap without adding
+NT4's tanh clamp to TRTLLM-gen. Only layers 7,32,68 use the surrogate. All other
+decode layers use native clamped CUTLASS+NVLS; prefill is unchanged.
+All seven arms use --branch-native-output: save local routed inputs in the
+route_dispatch phase, time the selected backend through the branch join, then
+recompute clamped CUTLASS+NVLS output with tactics [39,428] on the joined main
+stream. That output continues through postprocess and the model. This applies
+in warmup and captured graphs. Input-copy overhead is common to all arms; native
+recomputation is outside every branch interval but changes cache/work history.
+No numerical gates are removed. The selected MegaMoE and TRTLLM paths retain
+their independent checks. Full-model eager/graph checks remain enabled. The measured
+block hidden states are replayed from existing captured inputs. KV/recurrent
+state is not independently matched. This is NOT NT4 generation-quality or E2E
+throughput evidence, and NOT a proven speed-of-light bound.
+
+The weight bytes and logical E8M0 scales are preserved, then shuffled offline.
+FC1 is non-gated [128,4096,768], FC2 [128,768,4096], top-k 10, EP4. Routing weights
+are supplied explicitly. TRTLLM locally finalizes to BF16, copied to FP32 before
+NVLS reduction; the MegaMoE hybrid assembles FP32 partials. Both costs are timed.
+
+Preflight (four GB300 GPUs, existing setup/env):
+  export NT4_TRT_SURROGATE_ROOT="$NT4_LOG_DIR/nt4-trtllm-surrogate-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$NT4_TRT_SURROGATE_ROOT"
+  "$PY" -m torch.distributed.run --standalone --nproc-per-node=4 \
+    "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_trtllm_surrogate.py" \
+    --artifact "$NT4_LOG_DIR/nt4-checkpoint-layer-20261012-080901" \
+    --mcore-root "$MCORE_CHECKOUT" > "$NT4_TRT_SURROGATE_ROOT/preflight.log" 2>&1
+
+Then (use the newly synced runner, not the old isolated copy):
+  unset NT4_SURROGATE_RUNNER
+  bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_trtllm_surrogate_sweep.sh"
+
+The script requires all four preflight PASS records, does not relax correctness
+checks, and uses existing inputs at nt4-mxfp8-hybrid-20261019-140037/inputs.
+Override NT4_SURROGATE_INPUTS if needed (same prompt/round/step/occupancy contract).
+Seven arms: tuned CUTLASS overlap/serial, MegaMoE hybrid serial, TRTLLM serial,
+MegaMoE hybrid overlap, TRTLLM overlap, tuned CUTLASS overlap again for drift.
+Full decode graphs, controlled GC, 128 requests, 64 generated tokens, 2 rounds.
+TRTLLM local tactics are autotuned outside graph capture and NVLS collectives.
+Autotuning may download additional cubins into the persistent FlashInfer cache.
+
+Results: $NT4_TRT_SURROGATE_ROOT/comparison-native-output/surrogate-summary.json
+Summary requires 384 matched records per arm; checks hidden-state AND native continuation output hashes,
+decode positions, active requests, backend flags, precision and CUTLASS tactics.
+Per-rank medians are kept to expose rank skew; phase intervals include waits.
+
+Deployment on 2026-10-20 used an isolated nt4_e2e_trtllm_surrogate.py runner,
+selected by NT4_SURROGATE_RUNNER, to leave the existing remote driver untouched.
+The new continuation behavior is opt-in via --branch-native-output; ordinary
+E2E runs keep their existing execution path.
+The previous remote graph adapter was backed up in the experiment root.
+
+The comparison-native-output directory is new; previous failed comparison logs
+remain untouched. NT4_SURROGATE_COMPARISON_ROOT can choose another fresh directory.
+Existing successful preflight.log can be reused: TRTLLM math/packing is unchanged.
+Rerun every comparison arm under this protocol; do not mix old and new timings.
+Sync the examples/moe_ep directory, including nt4_branch_native_output.py,
+nt4_branch_probe.py, nt4_model_graph.py, nt4_e2e_graph.py, nt4_e2e.py and the
+surrogate sweep/summary scripts. MCore needs no changes for this fix.

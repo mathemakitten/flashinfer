@@ -1,0 +1,256 @@
+NT4 layer-32 expert-stage attribution (research diagnostic)
+
+Capture: nt4-expert-stage32-20261029-144918, ranks 0..3.
+Matching serial trace: nt4-trt-cubin-trace-serial-internal-20261029-145126.
+All four ranks selected FC1 config 5 and FC2 config 7. The replay pins those
+through the exported legal factorization table. Do not reuse these hardcoded
+coordinates for other captures without checking the selected cubin trace.
+
+FC1 includes its activation/quantization epilogue. FC2 receives identical
+post-activation FP8 bytes and raw scales from the captured TRT graph workspace.
+Layout conversion is checked byte-for-byte. FC2 is checked against FP64
+matmul of dequantized inputs/weights. The 1.5% diagnostic gate is provisional,
+not the model's acceptance criterion. Exact stage/full and poisoned-replay
+checks are additional requirements. Failures invalidate timing conclusions.
+
+TRT graph replay disables all nodes except the selected GEMM. PDL is disabled;
+disabled-node graph overhead remains. MegaMoE uses its lean compute base,
+M128/N256/K128, 152 clusters and group512. Stage filtering retains scheduler
+traversal; counter reset is timed. Its resource footprint is different from
+the integrated communication wrapper. Do not add overlapping internal clocks,
+interpret stage sums as an E2E prediction, or claim a deployment speedup.
+
+First run rank0; qualify before repeating ranks1..3. These are captured routed
+rows, not a synthetic uniform distribution. Save timings with counts and
+selected cubin names. Use uninstrumented integrated runs for final claims.
+
+2026-10-29 FC2 follow-up (--fc2-scheduling-sweep)
+Measures group512 controls around group128/group1024 with counters initialized
+outside graph capture. Also times counter fill alone and brackets with the
+unchanged TRT FC2. Each candidate must reproduce the existing FC2 output exactly,
+including after poisoning output and replaying the graph. This is a scheduling
+attribution experiment, not selection of a full-model default.
+
+Rank0 scheduler simulation: 960 assignments, 41 nonempty experts, maximum124
+rows/expert. M128 yields 41 token tiles, FC1=656 tiles and FC2=123 tiles.
+Modulo152 static assignment (including skipped FC1 positions):
+  group128: 27 FC2 workers, maximum5 FC2 tiles/worker
+  group512: 115 FC2 workers, maximum2 FC2 tiles/worker
+  group1024: 123 FC2 workers, maximum1 FC2 tile/worker
+Filtering FC1 preserves these positions. Thus isolation can expose scheduling
+imbalance which does not directly measure FC2's critical path in the fused run.
+The simulator predicts assignments, not latency or actual execution overlap.
+
+Run root: /lustre/fsw/portfolios/nemotron/users/helenn/logs/nt4-fc2-scheduling-20261029
+Four rank workloads run sequentially on tmux0; stop on first failed candidate.
+
+FC2 pipeline follow-up (--fc2-pipeline-sweep)
+Fixes group512, M128/N256/K128, 152 clusters; reduces A/B stages from3/4 to2/3.
+Estimated shared-memory reduction is50688 bytes/CTA. TMEM allocation remains
+512 columns: lower shared memory alone does not establish better occupancy.
+Reduction2 is invalid for this geometry (minimum two stages), so is not tested.
+Keeps the same exact-output/poisoned graph checks and bracketing controls.
+Run root: logs/nt4-fc2-pipeline-20261029; four rank workloads, sequential tmux0.
+
+Causal follow-ups, 2026-10-29:
+--fc2-experiment atomic compares static group512 with atomic-counter assignment
+at group512 and1024. All arms include identical counter-zero work. This tests
+software dynamic acquisition, NOT the effect of hardware CLC. FC1 filtering
+still traverses combined work IDs, so the cost includes discarded FC1 claims.
+Run: nt4-fc2-atomic-20261029-151329. All four ranks pass exact output checks.
+Atomic512/control-start (us), ranks0..3:
+55.54/55.97,57.30/59.40,50.77/51.37,52.90/51.26. No universal gain.
+
+--fc2-experiment geometry admits N128 ONLY for the standalone FC2 diagnostic.
+Compare with/without one AB-stage reduction against N256 static controls.
+This changes tile count and resource layout together; stage counts are logged.
+The first prototype failed because accumulator stage stride retained a literal
+256 while the epilogue used tile_n. Stride now uses tile_n; N256 unchanged.
+Exact output checks must pass before interpreting any N128 timings.
+
+Unresolved causal comparison: otherwise-identical TRT kernels with static
+versus CLC scheduling. Current exported selected kernels use dynamic CLC;
+atomic-counter MegaMoE is not a matched control for that hardware mechanism.
+No claims of CLC's measured contribution should be made from these experiments.
+
+TRT scheduler follow-up: nt4_fc2_trt_scheduler.sh, tmux0.
+Existing exported N32/K256 FC2 kernels have identical recorded option fields
+except mTileScheduler (static vs persistent dynamic CLC). FC1 stays config5.
+FC2 uses config6/7, with actual graph kernel-name assertions before timing.
+Each rank runs CLC/static/CLC; all three must have identical common FP8 bytes,
+scale bytes, and FC2 output hashes. PDL remains disabled. Includes graph replay
+checks and the unchanged independent reference gate.
+This compares ordinary static launch to CLC persistent scheduling as a whole;
+it does NOT isolate CLC acquisition overhead from persistence. A static-
+persistent same-build twin remains necessary for that finer attribution.
+
+Commute queue: nt4_fc12_confirm.sh 128 (tmux0), 152 (tmux1).
+Four captured ranks each, fused FC1+FC2 with actual counter dependencies.
+N256 only: group512 controls, group1024, atomic512/1024, AB reduction1.
+Requires exact final output AND FC1 activation/scale agreement with fused control,
+plus poisoned graph output checks. All candidate graphs reset the same counters.
+Separate nodes require comparison to each node's own bracketing controls; worker
+count differences across nodes need subsequent same-node confirmation. This is
+compute-only fused replay, not model E2E or communication-overlapped execution.
+N128 remains FC2-diagnostic-only, not a qualified fused configuration.
+
+Live confirmation correction: existing MXFP8 DecodeAdapter.KNOBS already used
+1024, whereas isolated replay explicitly used512. Standalone improvement is NOT
+a new deployment gain. nt4_live_group_compare.sh checks1024/512/1024 with actual
+model shortcut overlap, coarse phase timing and matched native continuation.
+Two nodes use128/152 workers passed through the CLI (environment worker caps
+are cleared by nt4_e2e.py). Optional NT4_MXFP8_GROUP_HINT accepts only512/1024,
+prints the selected value and changes the Replay knobs, leaving default1024.
+These runs measure block contention in model context, not candidate-driven E2E
+throughput: native CUTLASS output continues after the timed branch join.
+
+Mixed FC1/FC2 geometry prototype (2026-10-29)
+-------------------------------------------
+--fc12-mixed-geometry keeps FC1 M128/N256/K128 and changes only FC2
+N to 128 inside the same lean fused kernel. Diagnostic-only; the communicating
+wrapper rejects this option until the lean implementation is qualified.
+
+The two phases share A storage and the existing FC1-sized B allocation. FC2
+uses a smaller B/SFB view with the original inter-stage strides, so neither
+phase can overwrite another stage's live data. The B barrier expects the FC2
+byte count; FC1 adds the remaining expected bytes before issuing either load.
+FC1's accumulator layout and readiness threshold remain unchanged. FC2 uses
+half-width MMA and output tiles and releases the accumulator only after all
+its reads; the previous first-subtile early release is unsafe with unequal
+phase widths. This conservative handoff is part of the measured candidate.
+
+The harness brackets group1024 N256 and group1024 mixed tiles with the original
+group512 controls. It requires exact valid-row FC1 bytes, FC1 scales, final
+output and poisoned graph replay. No numerical tolerances are widened. Four
+saved rank-local routing distributions run in separate processes; this is not
+an EP communication test or an E2E benchmark. Run:
+  bash examples/moe_ep/nt4_fc12_mixed_geometry.sh 152
+Use NT4_MIXED_RANKS=0 for the first compile/qualification probe.
+GPU qualification pending. Do not use as a deployment configuration.
+
+Qualification completed on nvl72d036-T17 / GB300, 152 workers:
+  nt4-fc12-mixed-w152-20261029-162954
+All four rank-local distributions passed exact fused output, FC1 bytes/scales,
+poisoned eager/graph replay and repeated post-timing poison checks. Timings
+include identical counter resets. Group1024 N256 means average of two controls:
+  rank   N256 us   mixed N128 us   latency reduction
+  0      70.544       69.676          1.23%
+  1      67.635       66.881          1.11%
+  2      75.055       73.833          1.63%
+  3      63.245       63.069          0.28%
+Group1024 control drift <=0.152%. This does NOT reproduce the 7--20% isolated
+FC2 gain at the fused-kernel level. No full-model or overlap claim; no default
+changed. Keep the communicating wrapper disabled for mixed geometry pending
+stronger evidence. Captures use the existing hardware-tanh variant and do not
+establish independent full-model NT4 numerical qualification.
+
+Bringup failures: probe1 was missing the shell checkout environment; 162323
+failed DSL region verification (fixed by passing layouts as kernel arguments);
+162442 stalled on transaction bytes being added by every warp lane (fixed by
+elect_one). That process and its suspended wrapper were explicitly terminated.
+The rank0 corrected probe 162742 passed; the four-rank run above is the result
+to use, with additional repeated-poison checks and matched group1024 controls.
+
+FC2 accumulator release experiment (2026-10-29)
+----------------------------------------------
+Run nt4_fc12_release_sweep.sh 152 (or --fc12-release-sweep in the replay).
+All candidates use group1024, unchanged FC1 M128/N256/K128, and the same
+worker count and A/B pipeline allocation. Candidates:
+  N256 auto: existing early release, bracketed before and after candidates.
+  N256 late: release only after all FC2 subtile reads.
+  N128 auto: previously qualified mixed-width late release.
+  N128 disjoint_late: shifted stage-1 accumulator, still late release.
+  N128 disjoint_early: same shifted layout, first-subtile release.
+
+TMEM columns (half-open intervals):
+  FC1 stage0 [0,256), stage1 [224,480), unchanged.
+  New FC2 stage0 [0,128), stage1 [352,480).
+  Scales start at column480. Allocation remains512 columns.
+Every opposite-parity transition involving FC2 has disjoint accumulator
+ranges. Only FC1->FC1 retains its existing32-column overlap and release order.
+Writer and epilogue reader both add128 columns for FC2 stage1. The late
+placement control distinguishes relocation effects from early-release effects.
+
+All these release-policy overrides remain lean-compute-only, guarded against
+use in the communicating wrapper. No defaults or numerical gates change.
+Poison FC1 bytes/scales and output, check exact eager/graph results, repeat
+with three poison patterns after timing. CPU interval audit and syntax checks
+passed; GPU qualification pending.
+
+Release experiment completed:
+  nt4-fc12-release-w152-20261029-164816 (nvl72d036-T17, GB300)
+All four distributions passed exact eager/graph, FC1 bytes/scales, repeated
+poison and post-timing output checks. Same152 workers/group1024; timings us:
+ rank N256 original* N256 late N128 old-late N128 shifted-late shifted-early
+  0       70.565       70.284      69.885          69.687          69.682
+  1       67.612       67.417      67.480          66.848          66.850
+  2       74.958       74.397      74.062          73.806          73.817
+  3       63.186       62.624      63.442          63.020          63.122
+ * average of bracketing group1024 controls; maximum drift0.238%.
+Early release vs the identical shifted-late layout differs by <0.11us in
+all cases, with no consistent benefit. The originalN256 late-release control
+is slightly faster, not slower. Thus the conservative release does not explain
+the missing isolated-FC2 gain on these captures. These are fused lean-kernel
+measurements including identical counter resets, not E2E or overlap results.
+No new full-model run is justified from this experiment alone. Keep defaults.
+
+FC1 store-path experiment and bounded queues (2026-10-29)
+-------------------------------------------------------
+--fc12-store-sweep compares existing TMA output staging with use_stg_fc1=True
+at group1024 (and a group512 STG cross-check), on original N256 FC1/FC2.
+Hardware tanh, inputs, quantization, FC1 scale stores, A/B stage counts and
+worker count remain fixed. Direct stores bypass sD and its TMA output transfers;
+the stage-budget calculation still reserves sD space, so this does not add
+A/B stages. Actual allocated shared memory can differ because sD is omitted.
+
+All four saved rank-local distributions passed exact eager/graph output,
+FC1 bytes/scales and repeated poisoned replay at both128 and152 workers:
+  nt4-fc12-store-w128-20261029-165841
+  nt4-fc12-store-w152-20261029-165841
+Standalone timings are roughly tied; no reliable universal speedup established.
+
+Private NT4_FC1_DIRECT_STORE=0|1 selects the same existing kernel option through
+the integrated MXFP8 factory and participates in its compile key. Each new
+bucket emits nt4_fc1_store_config. Default remains TMA; non-NT4 overrides rejected.
+
+nt4_fc1_store_queue.py requires four passing standalone summaries first. Plans
+14 model arms, stops on any nonzero child exit, and checks a fixed deadline
+before each arm (no new arm under10min remaining;2min cleanup reserve). It does
+not call Slurm or poll. The parent nt4_e2e enforces each child timeout/cleanup.
+Primary-worker serial and overlap TMA/STG/TMA brackets are followed by current
+hardware-tanh internal turnover attribution, then the alternate worker's brackets.
+Native CUTLASS outputs continue after the timed join. Existing hardware-tanh
+FC1 advisory is retained and NOT promoted to deployment numerical qualification.
+Internal timing arms are separate from coarse matched-block performance arms.
+
+Queues launched on2026-10-29:
+  tmux0 / nvl72d138-T18 / job4992027 / starts128 workers:
+    nt4-fc1-store-queue-w128-20261029-170200
+  tmux1 / nvl72d036-T17 / job4992554 / starts152 workers:
+    nt4-fc1-store-queue-w152-20261029-170200
+Logs are <root>.log, per-arm logs and queue-results.json. plan.json records the
+absolute deadline and planned arms. No promise of completion after deallocation.
+
+FC1-to-FC2 handoff attribution (2026-10-29):
+nt4_fc12_handoff_queue.py uses the qualified store variants in eight instrumented
+matched-input model arms per node (128/152 workers, serial/overlap, TMA/STG).
+Internal timing v6 reuses unused slots by warp role in the existing 40-slot
+buffer. It splits FC1 post-tile scheduler lookup, drain/fence, boundary barrier
+and flag bookkeeping; the latter may defer publication and is NOT a readiness
+completion timestamp. FC2 splits counter spin/acquire fences, descriptor setup,
+first pipeline-slot wait, later slot waits, and TMA issue. First FC2 tile IDs and
+wait/ready/first-issue/last-issue times are retained per CTA. Issue timestamps do
+not measure TMA completion. Counter partitions and timestamp ordering are checked.
+No synchronization or acceptance gates change. Instrumentation perturbs timing;
+these results must not be interpreted as throughput. GPU qualification pending.
+
+FC2 activation producer probe order (2026-10-30):
+nt4_fc2_probe_queue.py qualifies --fc12-probe-sweep on four rank-local captures,
+then queues bracketed matched-input serial/overlap comparisons at 128/152 workers
+with two repetitions, plus separate internal-clock attribution. Stop on failure
+or insufficient remaining allocation time. NT4_FC2_PROBE_AFTER_ISSUE=1 moves only
+the FC2 activation producer's next-slot try_acquire after current data+scale TMA
+issue. It retains all acquire/release operations, readiness waits and math; the
+flag enters the private compile key and is rejected outside NT4. Default is off.
+No throughput claim from native-continuation branch replay. CPU syntax and clock
+tests pass; GPU qualification and performance results pending. No vendor edits.

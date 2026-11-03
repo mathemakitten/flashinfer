@@ -179,6 +179,8 @@ class GluMxfp8Epilogue:
         use_stg_fc1: bool = False,
         combine_format: Optional[Any] = None,
     ) -> None:
+        self._packed_fc1_activation = False
+        self._hardware_tanh = False
         self.fc1_output_dtype = fc1_output_dtype
         self._debug_prequant_offset = None
         self._debug_prequant_width = 0
@@ -195,6 +197,10 @@ class GluMxfp8Epilogue:
         self._atom_thr_size = 2 if use_2cta_instrs else 1
         self._cta_tile_m = mma_tiler_mnk[0] // self._atom_thr_size
         self._cta_tile_n = mma_tiler_mnk[1]
+        self._fc2_tile_n = self._cta_tile_n
+        self._mixed_fc2_geometry = False
+        self._fc2_late_release = False
+        self._fc2_disjoint_acc = False
         self._mma_tiler_k = mma_tiler_mnk[2]
         self._cta_tile_n_sfb = ((mma_tiler_mnk[1] + 127) // 128) * 128
         self._static_expert_shape = static_expert_shape
@@ -533,6 +539,25 @@ class GluMxfp8Epilogue:
 
     # -- fc1 subtile: SM100 path --
     @cute.jit
+    def _turnover_now(self):
+        return Int64(llvm.inline_asm(
+            ir.IntegerType.get_signless(64), [], "mov.u64 $0, %globaltimer;", "=l",
+            has_side_effects=True, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ))
+
+    @cute.jit
+    def _turnover_write(self, ticks, warp_idx, slot: cutlass.Constexpr, value,
+                        add: cutlass.Constexpr = False):
+        if cute.arch.lane_idx() == 0:
+            # This diagnostic is restricted to 1-CTA clusters.
+            bx, by, bz = cute.arch.block_idx()
+            if cutlass.const_expr(add):
+                ticks[bz, warp_idx, slot] += value
+            else:
+                ticks[bz, warp_idx, slot] = value
+
+    @cute.jit
     def _run_fc1_task_tile(
         self,
         work_tile_info,
@@ -555,6 +580,7 @@ class GluMxfp8Epilogue:
         gmem_c: cute.Tensor,
         c_pipeline,
         debug_prequant_base: cutlass.Int64,
+        turnover_ticks=None,
     ) -> None:
         """MXFP8 fc1 task-tile: TmemTranspose16x32 TMEM loading + cross-warp E8M0 exchange."""
         real_fc1_output, _ = sched_ext.get_gmem_tensor(
@@ -574,7 +600,13 @@ class GluMxfp8Epilogue:
             real_c, _ = sched_ext.get_gmem_tensor("c", gmem_c, work_tile_info)
             c_n_base = work_tile_info.tile_n_idx * cutlass.Int32(self._subtile_cnt)
 
+        if cutlass.const_expr(turnover_ticks is not None):
+            wait_begin = self._turnover_now()
         acc_pipeline.consumer_wait(acc_consumer_state)
+        if cutlass.const_expr(turnover_ticks is not None):
+            ready_tick = self._turnover_now()
+            self._turnover_write(turnover_ticks, warp_idx, 29, ready_tick - wait_begin, True)
+            self._turnover_write(turnover_ticks, warp_idx, 37, ready_tick)
         iket.range_push("fc1_epi_tile")
 
         subtile_cnt = self._subtile_cnt
@@ -637,7 +669,11 @@ class GluMxfp8Epilogue:
                 tma_atom_c_arg = tma_atom_fc1_output
                 gmem_c_subtile_arg = real_fc1_output
 
+            _turnover_kwargs = {}
+            if cutlass.const_expr(turnover_ticks is not None):
+                _turnover_kwargs["turnover_ticks"] = turnover_ticks
             self._run_fc1_subtile(
+                **_turnover_kwargs,
                 subtile_idx=subtile_idx,
                 tmem_gate_tensor=tmem_gate,
                 tmem_up_tensor=tmem_up,
@@ -694,6 +730,12 @@ class GluMxfp8Epilogue:
                     work_tile_info.valid_tokens_in_cta_tile,
                 )
 
+        if cutlass.const_expr(turnover_ticks is not None):
+            done_tick = self._turnover_now()
+            if cute.arch.lane_idx() == 0:
+                bx, by, bz = cute.arch.block_idx()
+                turnover_ticks[bz, warp_idx, 31] += done_tick - turnover_ticks[bz, warp_idx, 38]
+                turnover_ticks[bz, warp_idx, 28] += 1
         iket.range_pop()
 
     @cute.jit
@@ -712,13 +754,35 @@ class GluMxfp8Epilogue:
         """
         # Non-gated NT4: weighted, tanh-soft-clamped squared ReLU.
         # Apply the routing weight before the MXFP8 handoff to FC2.
-        for i in cutlass.range_constexpr(cute.size(t_gate)):
-            z = fmax(t_gate[i], Float32(0.0))
-            c = self.glu_clamp * cute.math.tanh(z / self.glu_clamp, approx=False)
-            value = c * c
-            if cutlass.const_expr(prob is not None):
-                value = value * prob
-            t_swiglu[i] = value
+        if cutlass.const_expr(self._packed_fc1_activation):
+            # Preserve scalar tanh/division and multiplication association. Only
+            # pair independent channels; no approximate activation or FTZ change.
+            for i in cutlass.range_constexpr(0, cute.size(t_gate), 2):
+                z0 = fmax(t_gate[i], Float32(0.0))
+                z1 = fmax(t_gate[i + 1], Float32(0.0))
+                t0 = cute.math.tanh(z0 / self.glu_clamp, approx=self._hardware_tanh)
+                t1 = cute.math.tanh(z1 / self.glu_clamp, approx=self._hardware_tanh)
+                c0, c1 = cute.arch.mul_packed_f32x2(
+                    (self.glu_clamp, self.glu_clamp), (t0, t1),
+                    rnd="rn", ftz=False,
+                )
+                v0, v1 = cute.arch.mul_packed_f32x2(
+                    (c0, c1), (c0, c1), rnd="rn", ftz=False,
+                )
+                if cutlass.const_expr(prob is not None):
+                    v0, v1 = cute.arch.mul_packed_f32x2(
+                        (v0, v1), (prob, prob), rnd="rn", ftz=False,
+                    )
+                t_swiglu[i] = v0
+                t_swiglu[i + 1] = v1
+        else:
+            for i in cutlass.range_constexpr(cute.size(t_gate)):
+                z = fmax(t_gate[i], Float32(0.0))
+                c = self.glu_clamp * cute.math.tanh(z / self.glu_clamp, approx=self._hardware_tanh)
+                value = c * c
+                if cutlass.const_expr(prob is not None):
+                    value = value * prob
+                t_swiglu[i] = value
 
     @cute.jit
     def _run_fc1_subtile(
@@ -747,6 +811,7 @@ class GluMxfp8Epilogue:
         c_buffer_idx,
         c_pipeline,
         debug_prequant_base: cutlass.Int64,
+        turnover_ticks=None,
     ) -> None:
         """MXFP8 fc1 subtile: GLU + E8M0 SF + fp8 R2S."""
         iket.range_push("fc1_epilogue_subtile")
@@ -765,6 +830,14 @@ class GluMxfp8Epilogue:
             self._acc_pipeline_consumer_release(
                 acc_pipeline, acc_consumer_state, acc_is_release
             )
+            if cutlass.const_expr(turnover_ticks is not None):
+                if acc_is_release:
+                    release_tick = self._turnover_now()
+                    if cute.arch.lane_idx() == 0:
+                        bx, by, bz = cute.arch.block_idx()
+                        turnover_ticks[bz, warp_idx, 30] += release_tick - turnover_ticks[bz, warp_idx, 37]
+                        turnover_ticks[bz, warp_idx, 38] = release_tick
+
 
         # ── generate_c: store raw gate+up to GMEM C tensor via SMEM staging ──
         if cutlass.const_expr(self._generate_c):
@@ -977,12 +1050,12 @@ class GluMxfp8Epilogue:
         """
         iket.range_push("fc2_epilogue_subtile")
 
-        fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN  # = 8
+        fc2_subtile_cnt = self._fc2_tile_n // EpilogueTileN  # = 8
         hidden_group = (
             work_tile_info.tile_n_idx * cutlass.Int32(fc2_subtile_cnt) + subtile_idx
         )
         hidden_col_start = work_tile_info.tile_n_idx * cutlass.Int32(
-            self._cta_tile_n
+            self._fc2_tile_n
         ) + subtile_idx * cutlass.Int32(EpilogueTileN)
         r_acc_layout = cute.make_layout((((EpilogueTileN,), 1),), stride=(((1,), 0),))
         atom_t2r = cute.make_copy_atom(
@@ -1188,7 +1261,7 @@ class GluMxfp8Epilogue:
         ``subtile_idx`` is runtime (the overlap-acc walk reverses it on odd
         turns), so index with a const_expr if-chain -- mirrors fc1's rmem_sf.
         """
-        for j in cutlass.range_constexpr(self._cta_tile_n // EpilogueTileN):
+        for j in cutlass.range_constexpr(self._fc2_tile_n // EpilogueTileN):
             if subtile_idx == cutlass.Int32(j):
                 rmem_sf_fc2[j] = qpvscale
 
@@ -1215,7 +1288,7 @@ class GluMxfp8Epilogue:
         token row, so a single ``token_row_in_cta < valid_tokens`` guards the
         whole flush (all subtiles share the token, only the block index moves).
         """
-        fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN
+        fc2_subtile_cnt = self._fc2_tile_n // EpilogueTileN
         thread_in_warp = tidx % WarpThreadCount
         token_row_in_cta = cutlass.Int32(warp_idx * WarpThreadCount) + thread_in_warp
         if token_row_in_cta < work_tile_info.valid_tokens_in_cta_tile:
@@ -1247,7 +1320,7 @@ class GluMxfp8Epilogue:
             else:
                 for j in cutlass.range_constexpr(fc2_subtile_cnt):
                     block_hidden_start = work_tile_info.tile_n_idx * cutlass.Int32(
-                        self._cta_tile_n
+                        self._fc2_tile_n
                     ) + cutlass.Int32(j * EpilogueTileN)
                     if block_hidden_start < valid_hidden:
                         stg_e8m0_from_f32(sf_byte_addr + Int64(j), rmem_sf_fc2[j])
@@ -1283,7 +1356,14 @@ class GluMxfp8Epilogue:
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_push("fc2_epi_tile")
 
-        fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN  # = 8
+        fc2_subtile_cnt = self._fc2_tile_n // EpilogueTileN  # = 8
+        if cutlass.const_expr(self._fc2_disjoint_acc):
+            # Match the MMA writer's stage-1 offset; stage 0 is unchanged.
+            stage_offset = (cutlass.Int32(1) - is_odd_turn) * 128
+            tmem_acc_tensor = cute.make_tensor(
+                tmem_acc_tensor.iterator + cute.assume(stage_offset, divby=16),
+                tmem_acc_tensor.layout,
+            )
 
         if cutlass.const_expr(self._overlapping_accum):
             # Start subtile mirrors fc1: last for odd turn, first for even.
@@ -1332,15 +1412,18 @@ class GluMxfp8Epilogue:
                 rmem_sf_fc2=rmem_sf_fc2,
             )
 
-            if cutlass.const_expr(self._overlapping_accum):
+            if cutlass.const_expr(self._overlapping_accum and not self._fc2_late_release):
                 self._acc_pipeline_consumer_release(
                     acc_pipeline, acc_consumer_state, i == 0
                 )
 
             tmem_t = self._advance_fc2_tmem_tensor(tmem_t, tmem_forward_cols)
 
-        # Release AFTER all subtile reads (never early-release for FC2).
-        if not cutlass.const_expr(self._overlapping_accum):
+        # Late-release control and the original mixed-width layout retain
+        # ownership until all reads finish.
+        if cutlass.const_expr(not self._overlapping_accum or self._fc2_late_release):
+            # With unequal widths the shared 32-column boundary is not always
+            # the first FC2 subtile. Retain ownership through all FC2 reads.
             self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, True)
 
         # Flush the buffered E8M0 scales (one stg.64 per thread when aligned).
@@ -1397,6 +1480,7 @@ class GluMxfp8Epilogue:
         alpha=None,
         norm_const=None,
         token_comm_args=None,
+        turnover_ticks=None,
         # generate_c: pass real sC / tma_atom_c / tma_tensor_c when True;
         # pass smem_fc1_output_buffer / tma_atom_fc1_output / gmem_fc1_output as
         # dummies when False — const_expr guards ensure no access.
@@ -1447,6 +1531,11 @@ class GluMxfp8Epilogue:
         is_odd_turn = cutlass.Int32(1)
 
         bidx, bidy, bidz = cute.arch.block_idx()
+        if cutlass.const_expr(turnover_ticks is not None):
+            assert self._overlapping_accum
+            self._turnover_write(turnover_ticks, warp_idx, 26, self._turnover_now())
+            for slot in cutlass.range_constexpr(28, 40):
+                self._turnover_write(turnover_ticks, warp_idx, slot, cutlass.Int64(0))
         work_tile_info = sched_consumer.consume_work()
 
         flag_tracker = GpuReleaseFlagBatchTracker(
@@ -1483,7 +1572,11 @@ class GluMxfp8Epilogue:
                         token_comm_args.local_zero_prefix.iterator.toint()
                         + cutlass.Int64(self._debug_prequant_offset)
                     )
+                _turnover_kwargs = {}
+                if cutlass.const_expr(turnover_ticks is not None):
+                    _turnover_kwargs["turnover_ticks"] = turnover_ticks
                 self._run_fc1_task_tile(
+                    **_turnover_kwargs,
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_stage_tesnor,
                     acc_pipeline=acc_pipeline,
@@ -1536,7 +1629,14 @@ class GluMxfp8Epilogue:
             )
             cur_fc2_expert_idx = work_tile_info.expert_idx
 
+            if cutlass.const_expr(turnover_ticks is not None):
+                handoff_begin = self._turnover_now()
             work_tile_info = sched_consumer.consume_work()
+            if cutlass.const_expr(turnover_ticks is not None):
+                handoff_sched_end = self._turnover_now()
+                if cur_was_linear1:
+                    self._turnover_write(turnover_ticks, warp_idx, 32,
+                                         handoff_sched_end - handoff_begin, True)
 
             # Drain fc1 TMA/STG stores before publishing the fc1-done counter.
             if cur_was_linear1:
@@ -1544,7 +1644,17 @@ class GluMxfp8Epilogue:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 cute.arch.fence_acq_rel_gpu()
 
+            if cutlass.const_expr(turnover_ticks is not None):
+                handoff_drain_end = self._turnover_now()
+                if cur_was_linear1:
+                    self._turnover_write(turnover_ticks, warp_idx, 33,
+                                         handoff_drain_end - handoff_sched_end, True)
             task_tile_boundary_bar.arrive_and_wait()
+            if cutlass.const_expr(turnover_ticks is not None):
+                handoff_barrier_end = self._turnover_now()
+                if cur_was_linear1:
+                    self._turnover_write(turnover_ticks, warp_idx, 34,
+                                         handoff_barrier_end - handoff_drain_end, True)
 
             if cur_was_linear1:
                 flag_tracker = flag_tracker.accumulate(
@@ -1552,6 +1662,10 @@ class GluMxfp8Epilogue:
                     self._epi_fc1_batch,
                     (gmem_fc1_done_counter.iterator + cur_fc1_counter_slot).toint(),
                 )
+                if cutlass.const_expr(turnover_ticks is not None):
+                    self._turnover_write(turnover_ticks, warp_idx, 35,
+                                         self._turnover_now() - handoff_barrier_end, True)
+                    self._turnover_write(turnover_ticks, warp_idx, 36, cutlass.Int64(1), True)
             else:
                 if cutlass.const_expr(self._token_back_by_dispatch):
                     # Fence before (deferred) counter release: make the fc2
@@ -1572,3 +1686,5 @@ class GluMxfp8Epilogue:
                 )
 
         flag_tracker.fire()
+        if cutlass.const_expr(turnover_ticks is not None):
+            self._turnover_write(turnover_ticks, warp_idx, 27, self._turnover_now())

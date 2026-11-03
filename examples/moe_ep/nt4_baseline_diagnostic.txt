@@ -1,0 +1,86 @@
+NT4 256-request baseline-agreement investigation
+
+Qualification update: nt4_stagewise_v6_independent_provisional
+MegaMoE qualification retains independent FC1 boundary, FC2 contribution,
+per-expert original-reference, recombination, aggregate output and padding
+checks. Finite CUTLASS/reference and MegaMoE/CUTLASS differences are now reported
+as backend_agreement with numerical_gate=false, not independent failures.
+Malformed or nonfinite backend outputs remain fatal. Hybrid/direct and all
+graph/eager/changed-route checks retain their gates. A correctness PASS is
+explicitly independent qualification, not numerical equivalence to CUTLASS.
+No thresholds were widened. The provisional reference model remains provisional.
+Layer14/expert180's actual FC1 snapshot showed 18 versus reference16 at channel822,
+with the independent activation interval crossing their midpoint17. This explains
+why backend agreement cannot serve as the sole correctness oracle. It does not
+prove every later backend difference has that explanation; all are still logged.
+The full 256-request model run must be repeated; it has not passed under v6 yet.
+
+Set NT4_BASELINE_FAILURE_ROOT to a new directory for a direct/hybrid E2E run.
+When the aggregate stagewise check fails, all EP ranks save their canonical
+weights and local input/routes/probabilities, plus three distinct outputs:
+  baseline: live CUTLASS+NVLS invocation
+  megamoe: direct MegaMoE used by the qualification check
+  reference: the independent stagewise reference
+The original assertion is still raised. A complete capture means all files
+were saved, not that validation passed. No capture occurs when the variable
+is unset. Capture happens outside timed rounds and uses one payload per rank
+for weights and one for the failing sample.
+
+After capture, without loading MCore or the checkpoint:
+
+"$PY" -m torch.distributed.run --standalone --nproc-per-node=4 \
+  "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_baseline_diagnostic.py" \
+  --artifact /path/to/failure-root/layer14-TIMESTAMP \
+  --output "$NT4_LOG_DIR/nt4-baseline-replay-$(date +%Y%m%d-%H%M%S)"
+
+This first diagnostic compares auto CUTLASS selection and explicit [39,428].
+It retains full concatenated routing geometry and per-rank expert weights.
+It compares the sum of local BF16 results (FP32 all-reduce then BF16) with the
+captured baseline, MegaMoE and reference. This is NOT an NVLS reproduction:
+if the saved baseline is not reproduced, investigate adapter/tactic/reduction
+semantics before blaming a GEMM. No timing or acceptance gate is changed.
+Local outputs are saved for subsequent per-expert/stage diagnostics. This
+script does not yet expose fused CUTLASS FC1 workspace intermediates.
+
+Add --probe-slots to isolate each routing-weight column with the original full
+routing IDs, top-k width and batch shape. For the worst baseline/reference row,
+each rank reports local expert contributions against an FP64 FC1/activation/FC2
+reference with MXFP8 activation quantization and BF16 FC2 output. Both auto and
+[39,428] are probed. The sum of isolated BF16 outputs is compared to the original
+local output: this may introduce extra BF16 rounding, and zero weights may affect
+backend execution. These are interventions, not snapshots of kernel internals;
+do not attribute differences to FC1 without a further intermediate check.
+No acceptance gates or performance settings are changed. GPU validation pending.
+
+The slot probe now also searches mismatching expert outputs for single-block
+FP8 alternatives obtained from independently bounded activation endpoints.
+Each candidate must pass boundary_blocks (including the joint-scale witness
+where applicable) before propagation through FP64 FC2, BF16 output rounding,
+FP32 routing weighting, and final BF16 rounding. The best match reports changed
+channels, quantized values and the independent activation interval. This uses
+the existing provisional fc1_activation_interval assumptions. It does not
+observe the fused kernel intermediate or prove which path the kernel took.
+A failure to find a match does not exclude multi-block rounding alternatives.
+Run with --probe-slots; no extra flags or kernel rebuild needed. GPU pending.
+
+Actual FC1 snapshot (requires a separate diagnostic CUTLASS JIT build):
+  --snapshot-fc1
+This selects a distinct fused_moe_103_nt4_fc1_snapshot_v1 module. The hook is
+compiled out of normal modules. On rank1, only the pinned [39,428] invocation
+with slot5 weights enabled is dumped: token155, expert180. It copies the actual
+post-activation MXFP8 row and the expert's scale segment BEFORE FC2 overwrites
+workspace. It does not expose raw FC1 accumulators or prequantized activations.
+Only three small snapshot files are written; no per-iteration dumping. Capture
+is rejected inside CUDA graphs. The C++ metadata records scale-atom alignment;
+the decoder fails closed unless it matches the verified CUTLASS 128x4 layout.
+The report includes dumped/undumped output agreement, actual FC1/reference
+error, block boundary checks, changed channels, and FC2+weighting predicted from
+the actual intermediate. Do not interpret the intermediate unless snapshot
+output agrees with the undumped output and the untapped baseline still matches
+the saved output. This diagnostic is untimed. CUDA compilation/GPU validation
+are pending; local CPU scale-index and boundary tests pass.
+
+The 256 run had passed MegaMoE intermediate and contribution checks at layer14;
+its independent output error was 0.00353% global / 0.06385% worst row. The stop
+was baseline agreement: CUTLASS-reference worst row 1.97624%, MegaMoE-CUTLASS
+1.96568%. Do not treat this capture as proof of a defect in either kernel.

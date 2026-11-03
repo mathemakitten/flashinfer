@@ -15,6 +15,13 @@
  */
 
 #include <algorithm>
+#ifdef FLASHINFER_NT4_CUBIN_TRACE
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#include <string>
+#endif
 #include <cstring>
 #include <vector>
 
@@ -299,7 +306,27 @@ void TrtllmGenBatchedGemmRunner::run(
       "Config index", configIndex, "is out of range; the manifest has", numConfigs, "configs");
   checkPassingConfigIndex(mPassingConfigIndices, configIndex);
   auto const& config = configs[configIndex];
-  // printf("running config %d: %s\n", configIndex, config.mFunctionName);
+#ifdef FLASHINFER_NT4_CUBIN_TRACE
+  // Opt-in host-side launch identity; no synchronization or device instrumentation.
+  // The Python diagnostic sets context only after autotuning has completed.
+  if (auto context = std::getenv("NT4_CUBIN_TRACE_CONTEXT")) {
+    static std::mutex traceMutex;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> guard(traceMutex);
+    auto key = std::string(context) + ":" + std::to_string(configIndex) + ":" +
+               std::to_string(numTokens);
+    if (seen.insert(key).second) {
+      std::fprintf(stderr,
+          "NT4_CUBIN_SELECTED context=%s config=%d tokens=%d m=%d n=%d k=%d "
+          "threads=%d smem=%zu pdl_requested=%d function=%s\n",
+          context, configIndex, numTokens, m, n, k,
+          static_cast<int>(config.mNumThreadsPerCTA),
+          static_cast<size_t>(config.mSharedMemSize), static_cast<int>(enable_pdl),
+          config.mFunctionName);
+      std::fflush(stderr);
+    }
+  }
+#endif
 
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {

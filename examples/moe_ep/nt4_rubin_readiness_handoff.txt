@@ -1,0 +1,1419 @@
+Rubin readiness experiments: what the GB300 FC1/FC2 work tells us
+Updated 2026-11-03. Handoff for the Rubin research agent.
+
+Purpose
+-------
+Separate remote-data readiness from the expert kernel's internal activation
+pipeline. Counted writes or Lamport-style readiness should target a measured
+communication dependency, not be assumed to fix compute/staging contention.
+The store-path experiment below did not establish a consistent block-latency win.
+Later E2E and worker-cap results are summarized immediately below.
+
+
+Latest quality evidence and Rubin implications (2026-11-03)
+-----------------------------------------------------------
+Completed root (CMH, under /lustre/fsw/portfolios/nemotron/users/helenn/logs/):
+ nt4-likelihood-test-splits-20261102-140508
+Source scripts: nt4_likelihood_broad_queue.py and nt4_teacher_forced_audit.py.
+All ten arms exited 0. Each passed exact own-eager/graph likelihood replay and
+same schedules; cross-arm corpus/schedule hashes agree. No throughput measured.
+
+Conditional decode perplexity (lower better):
+                              WikiText test    GSM8K test
+ BF16                         9.012523         2.460745
+ CUTLASS MXFP8                9.033553         2.463256
+ MegaMoE exp MXFP8            9.025581         2.461944
+ MegaMoE hardware tanh MXFP8  9.039077         2.461950
+ TRTLLM MXFP8, recorded       9.033553         2.463256
+
+Per dataset: first 128 distinct eligible test rows >=192 tokens, a 64-token
+prefix and 128 forced continuation tokens. Reported decode excludes the first
+prefill prediction: 16,256 tokens per arm/dataset. WikiText-103-raw-v1 and GSM8K
+main test splits. GSM8K text includes question plus gold worked answer; these
+are likelihoods, NOT generated-answer accuracy. Length/selection bias remains;
+test split does not certify absence from checkpoint pretraining. Passage-level
+bootstrap does not account for shared WikiText articles. Treat intervals as
+exploratory, not a broad model-quality qualification.
+
+Hardware minus exponential mean NLL (nats/token), paired passage bootstrap95:
+ WikiText +0.001494142 [0.000026167, 0.003036285], PPL +0.1495%.
+ GSM8K    +0.000002284 [-0.001123032, 0.001101438], PPL +0.000228%.
+Hardware minus CUTLASS intervals include zero on both corpora. BF16 has lowest
+observed mean PPL on both. Do not infer an equivalence guarantee or erase the
+existing local expert numerical exceptions from these aggregate measurements.
+
+TRT causal audit (old OpenMath corpus): zeroing layer7 TRT returned output changed
+15,881 scored-token log probabilities; arm exited0 and normal eager/graph replay
+was exact. This rejects the hypothesis that this TRT branch is disconnected.
+Unperturbed TRT records still exactly match CUTLASS on both new corpora. The audit
+does NOT establish distinct backend identity for the CUTLASS arm or explain that
+exact equality. Keep the TRT/CUTLASS independence caveat until the native backend
+selection and actual called kernel identities are audited. Perturbed likelihoods
+are not included in the quality table.
+
+What the Rubin agent should do with this:
+- Retain exponential activation as the numerically conservative scheduling
+  control; evaluate hardware tanh as a separate axis. Tiny aggregate changes
+  justify continued study, not silently relaxing expert-level validation.
+- Preserve both common-input likelihood checks and independent operator checks
+  when changing readiness/scheduling; forced token equality is bookkeeping,
+  not evidence of model-selected token equality.
+- These are GB300 quality measurements, not new communication/readiness evidence.
+  The measured-remaining-wait / CTA-retirement plan below is unchanged. Counted
+  writes/Lamport only target an identified readiness dependency; they do not
+  establish consumer admission or free resources by themselves.
+- Current E2E speed claims below remain fixed-length benchmark claims; the BASE
+  checkpoint's failed instruction-answer screen cannot qualify answer accuracy.
+
+
+Current decision brief for the Rubin agent (2026-11-02)
+-------------------------------------------------------
+This section supersedes earlier provisional conclusions in the chronology below.
+All measured results here are GB300, not Rubin. No counted-write or Lamport
+speedup has been measured. Do not describe these as validated Rubin mechanisms.
+
+Research conclusion
+-------------------
+Keep MegaMoE as a serious Rubin scheduling/communication research vehicle. We now
+have a competitive expert-compute implementation and a small matched E2E win at
+large batch, so it is no longer justified to assume TRTLLM has an insurmountable
+compute advantage. This does NOT prove megakernels are universally optimal or
+that more fusion is better. Our competitive configuration deliberately separates
+NVLS dispatch/combine and detaches completion/cleanup from large compute CTAs.
+The useful design property is coordinated work/readiness scheduling plus timely
+resource release, not literally one launch for the entire block.
+
+Current Mega candidate: MXFP8, grouped lookup scheduler, group_hint1024,
+152 workers, original fused geometry (no universal narrower-tile adoption),
+detached ordinary tail, NVLS hybrid, shortcut overlap. Hardware tanh is a separate
+numerical/performance experimental axis. Keep exponential tanh as the control.
+Actual CLC did not consistently beat simplified/static lookup on natural routes.
+Do not assume CLC, lower worker counts, or finer flags are automatic improvements.
+
+Comparable E2E evidence
+-----------------------
+NT4 on GB300 EP4; fixed OpenMath prompts;512 generated tokens/request;
+model token budget2048; whole-model decode graphs;controlled GC;32GiB state
+buffer. Wall throughput includes prefill and host work. Candidate outputs drive
+generation. Means of two measured rounds, NOT confidence intervals. Bracketing
+control ranges below are before/after means, not sample min/max or uncertainty.
+
+Batch/run                Mega exp controls  Mega hardware   TRT       HW vsTRT
+128 earlier              10152--10225       10194           10361     -1.61%
+256 HW-first             13447--13614       13708           13675     +0.24%*
+256 TRT-first            13381--13431       13615           13755     -1.02%
+512 earlier              16073--16177       16329           15989     +2.13%
+512 repeat HW-first      16174--16180       16264           16154     +0.68%*
+512 repeat TRT-first     16050--16217       16162           15946     +1.36%
+768 initial              17188--17257       17388           BLOCKED   n/a
+768 isolated TRT retry   17238--17276       not run         16974     n/a
+768 MATCHED              17203--17253       17551           17135     +2.43%
+Units output tokens/s. *CUTLASS controls drifted -14.4%/-12.4% in these runs;
+retain the evidence but do not present those CUTLASS comparisons as stable wins.
+768 matched exponential control drift +.293%; hardware beats faster exponential
+control by1.726%. At512, hardware's added value over exponential is not consistent.
+768 exp gain overTRT was1.55--1.78% in isolated retry, only.40--.69% in matched run.
+128/256 do not establish an advantage over TRT. No BF16 win established by this
+MXFP8 series. Do not pool across precision, run order, or instrumentation modes.
+
+Source roots under /lustre/fsw/portfolios/nemotron/users/helenn/logs/:
+ nt4-tanh-trt128-trt-first-20261030-154915
+ nt4-tanh-trt256-tanh-first-20261030-154210
+ nt4-tanh-trt256-trt-first-20261030-154215
+ nt4-tanh-trt512-trt-first-20261030-174251
+ nt4-tanh-trt512-tanh-first-20261102-071603
+ nt4-tanh-trt512-trt-first-20261102-081025
+ nt4-tanh-trt768-trt-first-20261102-071603
+ nt4-trt768-validation-isolation-20261102-082205
+ nt4-tanh-trt768-matched-isolated-20261102-093305
+Local CSV/figures: /Users/helenn/Downloads/nt4-e2e-consolidated-20261102/
+ throughput-all-completed.csv; chart/index.html; chart/nt4-throughput-simple.png;
+ chart/nt4-relative-speed.png. Stars were removed at user request;768 has a callout.
+
+Numerical status: NOT a shipping qualification
+----------------------------------------------
+Hardware Mega still raises expert and combined-output numerical exceptions.
+TRT still raises local-expert exceptions. Finite exceptions are explicit
+NOT_PASSED/exploratory records; an exit0 does not override that status. In matched
+768 TRT recombined checks maxglobalL2 .002717959, maxrow .011840292, within current
+provisional1.5% gates. That does not erase its local-expert rejection.
+Own-eager graph equality passed; it is not independent numerical correctness.
+
+The original768 TRT arm was blocked by an unrelated MegaMoE prerequisite check.
+Captured at layer59/expert84. Isolated bootstrap now validates TRT local outputs
+and independently reduced final outputs without running MegaMoE first; poison,
+changed-route and graph checks remain. Source patch/provenance is saved with run.
+No shared adapter was changed for these experiments.
+Saved-rejection FP64 audit nt4-exp768-fp64-audit-20261102-093305:
+one activation differs from idealFP64 quantization by7.62939453125e-6; quantized
+matrix relativeL2 2.5083e-8; propagating saved activation through identicalFP64FC2
+gives1.6412e-8 relativeL2. Actual kernel FC1 accumulators are unavailable. This
+is evidence of tiny impact in that saved case, not proof the boundary gate is
+wrong or permission to relax it. Ideal quantizer excludes FP32 reciprocal effects.
+
+Hardware-tanh token flips are real on fixed prefixes, not graph mismatch:
+ nt4-tanh-known-prefix128-20261102-075139
+ nt4-tanh-prefix-layer-ablation128-20261102-083128
+ nt4-tanh-prefix-quarter128-20261102-093305
+For request124, changing only MoE layers[23,25,27,29,32,34,36] switches A->The;
+changing[7,9,11,14,16,18,20] leaves its entire captured logit vector unchanged.
+For request108, either group alone creates a dot/closeparen tie (argmax picks')').
+Effects are not additive and these two cases do not measure answer accuracy.
+Do not infer one pathological layer or use them to justify selective precision.
+
+Accuracy queue: nt4-tanh-answer-screen-20261102-074414 on tmux3.
+As of the latest read, batches0--2 (384 distinct prompts) complete and scored;
+batch3 just started. Each batch~63minutes. Allocation had~37min left;12000s outer
+wrapper expires sooner. Full512 plus final logit replay will not finish as queued.
+Scores saved incrementally in answer-score-summary.json/answer-score-records.json.
+Need recover/resume unfinished arms, not rerun completed384 prompts. Do not label
+this full512 qualification. Dataset is tuning-disjoint but not certified training
+heldout. Up to2048 generated tokens; report truncation and scorer failures.
+
+What Rubin should test next
+---------------------------
+1. Establish an ordinary-readiness Rubin baseline with this scheduling structure,
+   fixed activation/precision and route snapshots. Confirm supported compiler,
+   cubin architecture and launch resource geometry; do not transplant GB300's
+   152-worker choice as a Rubin optimum. Keep a comparable TRTLLM+NVLS baseline.
+2. Locate the remaining dependency on a matched per-invocation timeline. Keep
+   rank/layer separate. Measure last useful FC2, async drain, compute-CTA exit,
+   peer completion, reduction, mixer eligibility/start/completion, and block join.
+   Start with layers32/68; analyze layer7 rank skew separately. Existing worker
+   results show contention is phase/layer dependent, not a universal occupancy cap.
+   Do not add phase medians or infer causal order from static SASS address order.
+3. Only where remote readiness is on the critical path, compare ordinary vs
+   counted readiness on Rubin with IDENTICAL payload layout, math, reduction,
+   staging, CTA geometry and retirement. First use exponential tanh in BOTH arms
+   so numerical changes cannot masquerade as a scheduling result. Then replicate
+   the winning mechanism with the eventual qualified activation.
+4. Test independently delayed sender, delayed local compute, and delayed consumer.
+   Distinguish payload visibility, readiness notification, and source-buffer reuse.
+   Hardware counters do not automatically make a resident CTA release resources,
+   guarantee consumer admission, or establish every required memory-order edge.
+5. If the remaining delay is useful compute/resource contention rather than a
+   remote wait, prioritize compute-CTA retirement and selective phase/layer
+   scheduling. Counted writes cannot remove that contention. Use smaller tasks or
+   worker budgets only when join/E2E improves without excessive expert slowdown.
+6. Consider Lamport-style per-region readiness only if coarser readiness prevents
+   useful work AND there is a supported data-validity contract. Do not infer its
+   semantics from a -0 sentinel description alone. Use documented Rubin APIs.
+
+Decision criteria
+-----------------
+- Matched count notification reduces critical-path join and uninstrumented E2E:
+  pursue counted-write integration. Preserve ordinary path as control/fallback.
+- Notification becomes earlier but consumers cannot execute: scheduling/admission
+  is the next problem; more fine-grained signaling alone is not the solution.
+- Detached ordinary tail already hides the wait: no expected win from changing
+  notification; move to exposed compute/drain or other measured dependencies.
+- Gains appear only in synthetic skew, one layer, or instrumented runs: investigate
+  rather than claiming deployment benefit. Require repeated E2E and real routes.
+- Neither approach beats TRT end-to-end: keep TRT deployment option; Mega remains
+  a research vehicle, not a predetermined winner.
+
+API constraints supplied earlier by the user; agent must verify against actual kit
+---------------------------------------------------------------------------------
+NVSHMEM counted APIs use existing symmetric heap, not a separate heap. Symmetric
+uint64 counter needs256-byte-aligned heap offset; payload and counter reachable
+through same counted-capable destination logical endpoint. Pointer-based counted
+TMA was described as requiring same FLA page, otherwise demotion may skip update.
+Do not conflate that pointer restriction with NVSHMEM offset-based lowering.
+Counted fabric put wrappers are not identical to counted UTMASTG/UTMAREDG. Some
+counted TMA forms were PTX/internal-only. Obtain exact supported headers, completion
+and ordering contract, toolkit and hardware support before coding assumptions.
+
+Research handoff boundaries
+---------------------------
+Rubin agent should own readiness/scheduling work in a separate worktree. Leave
+active GB300 harness/kernel changes alone, do not edit CLAUDE.md, do not commit
+without user authorization. No tight filesystem or Slurm polling. Install/check
+NVSHMEM on new nodes. Verify current tmux ownership before launching anything.
+Do not spend Rubin compute repeating broad tanh attribution; that qualification
+track is owned here. Transfer exact workload, launch geometry, validity checks,
+activation and output-scope metadata with every comparison.
+
+Other recent wins and negative results (different scopes):
+* Lookup scheduling removes meaningful scheduling overhead in standalone kernels;
+  actual CLC did not consistently beat simplified static on natural saved routes.
+  Artificial delays can favorCLC; they do not establish an E2E improvement.
+* All-readyFC2 N128simplifiedstatic beatsN256lookup on3/4savedrankworkloads,
+  loses~13% onrank3. N128lookup losesall4. Not a universal geometry change.
+* Fused phase-separated single-group scheduler passes exact checks but ties the
+  faster grouped control. All-readyFC2 improvement did not transfer directly.
+* Fewer workers cost standalone compute:144~0--3.9%,128~2.9--11%,96~18--26%.
+* Matched overlap144vs152 replicated on2nodes: L68tail13--15%shorter but block
+  only .9--2.4%faster; L32block1.6--2.2%slower. L7rankskew inconclusive.
+  These retain nativeCUTLASScontinuation and instrumentation; NOT E2E results.
+  Layer-specific caps are proposed, not deployed or E2E validated.
+
+Implications for Rubin work:
+1. Target a measured critical dependency. Typical FC1ready-counter spin is small
+   versus later staging waits; per-invocation stragglers still require analysis.
+2. Tail progress is sensitive to resource occupancy, but freeing workers trades
+   against expert compute. A faster readiness notification alone cannot free
+   registers/shared memory or remove a local pipeline capacity constraint.
+3. Compare ordinary vs counted completion with identical payload layout,compute,
+   reduction,staging,launch geometry and CTAretirement. Detached ordinarytail is
+   the control; it already releases largeCTAs before separate peer cleanup.
+4. Separate payload visibility, producer-buffer reuse and consumer readiness.
+   Verify actual API ordering/alignment/endpoint contracts on the target stack.
+   Do not invent Rubin wrappers or infer hardware guarantees from GB300 results.
+5. Keep communications and numerical experiments separate: exponential activation
+   is the comparison control. Hardwaretanh needs independent numerical/answer
+   qualification; token agreement alone is insufficient.
+6. Prioritize same-invocation timelines in L32/L68, including compute drain/exit,
+   reduction/peer wait,mixer eligibility/execution andjoin. Do not add rolemedians
+   or treat maxrank local durations as synchronized globalGPU timestamps.
+
+Current execution model
+-----------------------
+We are studying NT4 MXFP8 MegaMoE local expert computation with NVLS and shortcut
+MoE overlap, including the detached-tail prototype. FC1 writes quantized
+activations and scales; FC2's activation loader waits for a token-block readiness
+counter, then stages activations through a shared-memory pipeline. These local
+FC1-to-FC2 dependencies are distinct from remote dispatch and result-return
+readiness. A counter can already be ready while later staging slots remain busy.
+
+Completed evidence
+------------------
+1. Direct FC1 global stores versus the existing TMA store path:
+   Both nodes completed 14/14 model diagnostic arms, plus standalone qualification.
+   Direct stores reduced measured post-accumulator-release epilogue duration by
+   about 36–39%, but did not yield a meaningful consistent joined-block win.
+   Overlap changes ranged approximately -0.82% to +1.30% across the pooled layer
+   medians; serial changes were within about +/-0.5%. FC2 activation waits barely
+   changed. Do not mistake the epilogue interval reduction for a kernel speedup.
+
+2. Detailed handoff attribution:
+   Both nodes completed 8/8 arms. The new timing records passed consistency checks.
+   Across workers=128/152, serial/overlap, TMA/direct stores, and both nodes:
+
+   Counter                                  Layer 32       Layer 68
+   FC1-ready counter spin                   0.5–1.3 us    0.5–1.1 us
+   First activation staging-slot wait       ~0.03 us      0.03–0.06 us
+   Later activation staging-slot waits      19–20 us      21–26 us
+   MMA activation-operand waits             ~18 us        20–23 us
+   MMA weight-operand waits                 <1 us         ~1 us
+
+   These ranges summarize medians of cumulative per-warp counters. Different
+   warp roles overlap: DO NOT add these intervals or call them block latency.
+   The typical initial readiness wait is small, but stragglers remain:
+   median per-invocation maximum counter-spin time ranged 12–22 us at layer 32
+   and 16–25 us at layer 68. We have NOT excluded a readiness-critical CTA.
+   Layer 7 has substantial rank skew; do not fold it into layer 32/68 conclusions.
+
+Measurement limits
+------------------
+- Matched recorded inputs; checks confirmed identical input hashes across the
+  preceding store-path comparisons.
+- Instrumented model branch replay, not uninstrumented end-to-end performance.
+- Native CUTLASS outputs continue generation after the measured join. These runs
+  therefore do not qualify candidate-driven generation or candidate tokens/sec.
+- Existing hardware-tanh FC1 numerical advisory remains in effect. Success here
+  is not a new deployment numerical qualification.
+- Timing instrumentation perturbs execution. FC1 flag bookkeeping may defer
+  publication; its interval is not a precise counter-completion timestamp.
+- First/last TMA ISSUE markers are not transfer-COMPLETION markers.
+- Large median waits alone cannot identify the block's critical path. Preserve
+  rank, layer, invocation, CTA and dependency identity when reconstructing it.
+
+Running experiment: FC2 producer next-slot probe order
+-----------------------------------------------------
+The activation producer currently probes the next shared-memory staging slot
+before issuing the current tile's activation+scale TMA transfers. We are testing
+moving that probe AFTER the current transfers. Hypothesis: a waiting next-slot
+probe can delay useful current transfers. This is a hypothesis, not an established
+explanation; the precise try_acquire behavior and measured outcome matter.
+
+Private flag: NT4_FC2_PROBE_AFTER_ISSUE=1 (default 0).
+Math, readiness waits, pipeline acquire/release operations and tile geometry stay
+unchanged. The flag is in the private compile key and restricted to NT4.
+
+Each node runs:
+- Four rank-local routing-distribution qualifications, with exact FC1 bytes/scales
+  and output checks, poisoned intermediates, eager/graph replay, repeated poison.
+- 24 coarse model comparisons: two repetitions x two worker counts x two schedules
+  x control-start/candidate/control-end.
+- Four separate internally instrumented comparisons at the primary worker count.
+
+Latest observed status, 2026-10-30 07:19 PDT:
+- All eight standalone routing qualifications passed.
+- Both nodes had completed 13/28 model arms successfully and were running #14.
+- No model timing conclusion yet. Read final results before claiming a win.
+
+Interpretation for Rubin
+------------------------
+If the probe-order change helps:
+  Establish the gain with bracketed coarse timings and, if material, an
+  uninstrumented E2E confirmation. Use the improved local schedule as the Rubin
+  baseline. Do not attribute that gain to counted writes or remote signaling.
+If it does not help:
+  Inspect activation-transfer latency, buffer turnover, and consumer progress.
+  A new remote readiness primitive is not automatically the remedy.
+In either outcome:
+  We still need a matched critical-path timeline to determine whether remote
+  readiness, useful compute, or compute-CTA retirement delays the mixer/join.
+
+Suggested Rubin experiment
+--------------------------
+1. Identify a specific remote dependency: dispatch payload arrival -> expert
+   consumption, or expert-result arrival -> combine/tail consumption. The mixer
+   core may already be eligible independently; do not assume it should wait on
+   expert completion. Distinguish mixer core, post-processing/shared-expert tail,
+   result reduction and final join.
+2. Compare ordinary signaling with counted writes while keeping payload layout,
+   computation, reduction, staging, launch geometry and CTA retirement identical.
+3. Independently delay a sender, local computation, and a consumer. Verify data
+   visibility, completion accounting, buffer reuse and replay epochs separately.
+4. Introduce Lamport-style finer-grained readiness only if whole-buffer/lane
+   readiness demonstrably delays useful consumer work and a supported validity
+   interface exists. A faster signal cannot release still-live compute resources.
+5. Keep correctness/instrumented diagnostics separate from performance runs.
+   Carry over exact/poison/replay checks; do not weaken numerical acceptance.
+
+Rubin API constraints previously supplied by the user (verify against actual
+headers/toolchain before implementing; these GB300 experiments do not validate
+these API contracts):
+- NVSHMEM counted APIs use the existing symmetric heap, not a separate heap.
+- signal_addr is a symmetric uint64_t counter with a 256-byte-aligned heap offset.
+- Payload and counter must be reachable through the same counted-capable logical
+  destination endpoint. Heap membership alone does not establish eligibility.
+- Pointer-based counted writes have a same-FLA-page condition; do not conflate
+  their rules with endpoint-offset fabric operations or TMA counted forms.
+- Counted TMA wrappers may require Rubin-specific/PTX-level support. A normal TMA
+  C++ wrapper does not imply counted support. Do not invent a public API.
+
+Artifacts and source locations
+------------------------------
+Local checkout:
+  /Users/helenn/Documents/github/flashinfer-nt4-gb300-nvls
+Research branch at last inspection: helenn-nt4-detached-tail.
+Dirty research checkout: preserve unrelated changes, no commits made for this work.
+Owned kernel changes only; do not modify vendored MegaMoE src/ or CLAUDE.md.
+
+Source files relative to checkout:
+  examples/moe_ep/nt4_fc2_probe_queue.py
+  examples/moe_ep/nt4_expert_stage_replay.py
+  examples/moe_ep/nt4_expert_phase_clock.py
+  examples/moe_ep/nt4_expert_stage_replay.txt
+  flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/shim/mxfp8.py
+  flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/shim/nt4/kernel_mxfp8_glu_fc12.py
+  flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/shim/nt4/epilogue_mxfp8.py
+  flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/shim/nt4/megamoe_kernel_mxfp8.py
+
+Local downloaded timing records:
+  /Users/helenn/Downloads/nt4-fc1-store-queues-analysis.json
+  /Users/helenn/Downloads/nt4-fc12-handoff-analysis.json.gz
+
+Remote logs base:
+  /lustre/fsw/portfolios/nemotron/users/helenn/logs
+Completed roots:
+  nt4-fc1-store-queue-w128-20261029-170200
+  nt4-fc1-store-queue-w152-20261029-170200
+  nt4-fc12-handoff-w128-20261029-195000
+  nt4-fc12-handoff-w152-20261029-195000
+Current probe roots:
+  nt4-fc2-probe-w128-20261030-062000
+  nt4-fc2-probe-w152-20261030-062000
+Each queue has a sibling .log, queue-results.json, per-arm summary.json, and
+per-arm direct/branch-rank{0..3}.jsonl. Qualification is under qualification/.
+
+Operational constraints
+-----------------------
+CMH login: helenn@aws-cmh-slurm-1-login-02.nvidia.com
+SSH key: /Users/helenn/.ssh/id_ecdsa_cmh
+At launch tmux pane %0: nvl72d138-T03, job 5011015, primary workers128.
+At launch tmux pane %1: nvl72d055-T15, job 5011017, primary workers152.
+Allocations expire: inspect current ownership before launching anything.
+Do not interrupt these queues or launch competing work on their GPUs.
+No Slurm access inside compute nodes. Query Slurm only on login, sparingly.
+No filesystem or Slurm watch loops. Batch bounded reads and analyze locally.
+NVSHMEM nvshmem4py-cu13==0.4.0 was installed on both fresh nodes.
+
+Update: probe-order experiment completed (2026-10-30)
+---------------------------------------------------
+Both queues completed 28/28 model arms; all eight rank-local qualifications passed.
+Candidate flag was observed enabled in logs. Matched input hashes agree across
+candidate and bracket controls. Raw records downloaded locally to:
+  /Users/helenn/Downloads/nt4-fc2-probe-analysis.json.gz
+Derived comparisons:
+  /Users/helenn/Downloads/nt4-fc2-probe-comparison.json
+
+Median relative joined-block improvements over average bracketing controls,
+across two nodes, two worker counts, two repetitions (layers kept separate):
+  serial layer32: 0.03%; serial layer68: 0.29%
+  overlap layer32: 0.59%; overlap layer68: 0.33%
+Per-comparison overlap changes ranged 0.01–1.24% at layer32 and -0.25–1.36% at
+layer68. No clear material expert-kernel speedup. Do not claim an E2E gain.
+
+Crucial attribution correction: measured later-slot waits fell from about
+20–27 us to 1–2 us, but the staging issue/bookkeeping residual grew by roughly
+18–23 us. MMA activation waits stayed nearly unchanged. The large reduction in
+one counter is NOT evidence that the corresponding critical-path stall vanished.
+For example, 128-worker serial layer32: slot wait 20.24 -> 2.08 us, staging
+issue/bookkeeping 3.04 -> 20.84 us, MMA activation wait 17.86 -> 17.26 us.
+These are medians of cumulative warp counters, not additive block phases.
+
+Do not use the prior large slot-wait attribution as a proven bottleneck or as
+justification for counted-write acceleration. Before another scheduling change,
+inspect compiler placement and actual pipeline wait/issue instructions, then
+measure combined producer elapsed intervals and consumer progress. A matched
+Rubin remote-readiness experiment still requires identifying a real remote
+critical-path dependency independently of these local counter labels.
+
+Update: emitted-code audit (2026-10-30)
+--------------------------------------
+Both corrected candidate assembly captures completed successfully:
+  nt4-fc2-probe-assembly-i0-20261030-083952 (without internal counters)
+  nt4-fc2-probe-assembly-i1-20261030-083957 (with internal counters)
+Earlier control captures used generation16 against recorded generation64 and
+failed the occupancy gate. Their emitted binaries remain usable for code audit;
+they are NOT successful model runs. Corrected captures use generation64.
+
+Confirmed in uninstrumented SASS, rows512/local EP1/128 workers:
+  control: TRYWAIT at 0xec0, activation UTMALDG.2D at 0xee0,
+           scale UTMALDG.3D at 0xf10.
+  candidate: UTMALDG.2D at 0xee0, UTMALDG.3D at 0xef0,
+             next-slot TRYWAIT at 0xf00.
+The compiler preserves the requested ordering. Both report REG:70, STACK:0,
+LOCAL:0, static SHARED:1024 (this excludes dynamic shared memory). Thus no
+reported register-count or spill change explains the result.
+
+The installed wrapper calls try_acquire non-blocking, but its lower primitive
+is mbarrier.try_wait, documented locally as potentially suspending. Emitted SASS
+is SYNCS.PHASECHK.TRANS64.TRYWAIT, with predicate use in the subsequent acquire.
+Do not infer hardware behavior from the wrapper's docstring alone.
+
+Combined first-FC2-tile elapsed time, observed-ready -> last TMA issue, us:
+  workers layer schedule control candidate
+  128     32    serial    21.824  20.832
+  128     32    overlap   21.920  21.760
+  128     68    serial    22.432  21.792
+  128     68    overlap   23.008  21.920
+  152     32    serial    22.336  21.920
+  152     32    overlap   21.984  22.336
+  152     68    serial    23.040  23.616
+  152     68    overlap   23.808  23.616
+These are medians of per-record median CTA intervals from the previous matched
+runs. Last issue is not transfer completion. They do not show a 20us removal.
+
+At 128-worker serial layer32, cumulative later TMA issue counter is also flat:
+0.768 -> 0.704us. The growing issue/bookkeeping counter is a residual (total
+staging minus acquired-slot intervals), NOT a direct measure of TMA throughput.
+Instrumented SASS includes timer reads, timestamp global stores and dependency
+scheduling absent in the performance binary. We have not isolated which exact
+instruction accounts for the shifted residual; do not label it a proven TMA
+stall or proven hardware barrier stall. The supported conclusion is that the
+probe reorder changes measured attribution without a material critical-path win.
+
+Saved local audit artifacts:
+  Downloads/nt4-probe-uninstrumented-pair.tar.gz
+  Downloads/nt4-probe-uninstrumented-control.sass.txt
+  Downloads/nt4-probe-internal-control.tar.gz
+  Downloads/nt4-probe-internal-after.tar.gz
+  Downloads/nt4-probe-internal-control.sass.txt
+  Downloads/nt4-probe-internal-after.sass.txt
+  Downloads/nt4-probe-installed-pipeline.tar.gz
+  Downloads/nt4-fc2-probe-elapsed.txt
+All paths are under /Users/helenn. Candidate uninstrumented archive includes
+resources and SASS. Controls and candidates match rows512 configuration.
+
+Next experiment, if pursuing this dependency: use sparse endpoint timestamps
+instead of per-iteration timer/store instrumentation; measure producer elapsed
+and consumer MMA progress jointly. Only then vary A-pipeline depth or consumer
+release timing. Keep the probe reorder off by default and retain exact numerical
+gates. No further GPU experiment was launched during this audit.
+
+Sparse endpoint follow-up launched (2026-10-30)
+---------------------------------------------
+Private NT4_EXPERT_SPARSE_TIMING=1 mode, mutually exclusive with dense internal
+counters. First FC2 tile per CTA only. Producer retains begin/ready/last-issue
+endpoints in registers until after its K loop. MMA retains before-acquire and
+after-commit-issue endpoints until after its K loop. No per-K timer or timestamp
+store. This still perturbs execution and does not measure asynchronous MMA
+completion. First-tile identity (expert, M, N) must match between producer and MMA;
+stale/missing/out-of-parent records fail decoding. Existing graph/numerical
+checks retained. Hardware-tanh advisory unchanged. Native continuation remains.
+12 CPU clock tests pass; GPU compilation/validation pending at launch.
+
+Queues: nt4_fc2_sparse_queue.py, four arms/node, original/reordered probes,
+serial/overlap, 128 workers on tmux0 and 152 on tmux1. Recorded64-token input
+sequence retained. Deadline bounded, no polling or Slurm queries.
+Remote logs base /lustre/fsw/portfolios/nemotron/users/helenn/logs:
+  nt4-fc2-sparse-w128-20261030-085500.log
+  nt4-fc2-sparse-w152-20261030-085500.log
+Data directories have the same names without .log. Raw per-CTA rows are in
+expert_fc2_sparse in each branch record. This is an attribution experiment,
+not a new candidate throughput claim or proof of TRTLLM's advantage.
+
+Sparse endpoint results completed (2026-10-30)
+--------------------------------------------
+8/8 arms exit0. Each arm has64 records/layer (4 ranks x2 rounds x8 samples).
+Input hashes match control/candidate per rank/round/sample/layer. Sparse decoder
+accepted tile identity and timestamp ordering. These diagnostics retain native
+continuation and tanh advisory; successful runs are not deployment qualification.
+
+Overlap medians, us, original -> probe-after:
+workers layer producer-ready-to-last-issue MMA-before-acquire-to-commit-issue
+128     32    20.20 -> 20.15               21.41 -> 21.41
+128     68    21.57 -> 21.69               22.90 -> 22.88
+152     32    22.16 -> 22.05               23.81 -> 23.57
+152     68    23.73 -> 23.68               25.44 -> 25.40
+Serial likewise nearly unchanged. These are medians of within-record CTA medians,
+not sums of phase medians. Consumer commit issue trails last producer load issue
+by about1.2–1.7us on layers32/68. Neither timestamp denotes asynchronous completion.
+No causal bottleneck direction follows from these endpoints alone: producer can
+wait for consumer buffer release while consumer waits for operands. Sparse
+instrumentation supports rejecting the claimed20us improvement from probe order.
+
+Layer7 join still has large inter-arm variation; do not attribute it to this
+local code change. Worker counts are on separate nodes in this experiment, so
+128vs152 is not a controlled worker-count performance comparison.
+
+Artifacts: /Users/helenn/Downloads/nt4-fc2-sparse-records.tar.gz,
+nt4-fc2-sparse-comparison.json. Analysis: /tmp/analyze_sparse.py.
+Suggested next causal intervention: matched pipeline-depth/consumer-release
+experiment with unchanged tile geometry and math; measure uninstrumented kernel
+and joined block separately from sparse traces. Verify shared-memory/occupancy
+changes explicitly. Do not interpret this as evidence that counted writes solve
+the local pipeline or as a full explanation of TRTLLM's lead.
+
+Independent operand-depth follow-up launched (2026-10-30)
+-------------------------------------------------------
+nt4_pipeline_side_queue.py uses private NT4_PIPELINE_REDUCE_SIDE=none|a|b.
+Removes exactly one A or B stage, minimum two; rejects simultaneous AB reduction.
+Tile geometry, activation, grouping1024, worker count128 and probe order original
+are held fixed. A/B pipelines are shared by FC1 and FC2; this is not FC2-only.
+Resource log includes original/new stage counts and layout-budget SMEM release.
+Freed memory remains a possible contention confound; no achieved-occupancy claim.
+
+Each node: serial control/candidate/control with sparse timing OFF, then serial
+control/candidate sparse diagnostic, then overlap control/candidate/control.
+Coarse graph phase markers remain in all arms; not uninstrumented E2E throughput.
+Same recorded64-token inputs and existing numerical/changed-route gates retained.
+No additional standalone qualifier is claimed. Local syntax/depth-policy checks
+pass; new GPU configurations still require the model-arm validation.
+Deadline check stops new arms with <600s remaining,120s shutdown margin.
+
+Tmux0 A reduction: logs/nt4-pipeline-side-a-20261030-092300[.log]
+Tmux1 B reduction: logs/nt4-pipeline-side-b-20261030-092300[.log]
+Both roots under /lustre/fsw/portfolios/nemotron/users/helenn.
+No commits or CLAUDE.md edits made.
+
+Independent operand-depth results (2026-10-30)
+---------------------------------------------
+Both8-arm queues completed exit0. Per-rank/round/sample/layer input hashes match
+all bracketing controls. Defaults A3/B4; A candidate A2/B4; B candidate A3/B3.
+Layers32/68 expert control drift <=1.54% (most below1%); layer7 join remains noisy.
+Results relative to mean of start/end control medians:
+  A2/B4 serial expert latency +8.12%/+8.51% (layers32/68)
+  A2/B4 overlap expert latency +9.65%/+7.67%; join +4.96%/+3.80%
+  A3/B3 serial expert latency +0.88%/+2.22%
+  A3/B3 overlap expert latency +0.57%/+1.57%; join +1.22%/+0.39%
+Small B effects require caution given drift. No improvement established.
+
+Sparse first-FC2-tile serial medians, original -> reduced (us):
+  A layer32 producer20.40->24.14; MMA21.55->24.71
+  A layer68 producer21.38->24.42; MMA22.55->25.09
+  B layer32 producer20.47->21.38; MMA21.62->22.30
+  B layer68 producer21.25->22.12; MMA22.32->22.98
+A reduction is materially more damaging. This is causal sensitivity to a depth
+intervention, not proof that activation HBM bandwidth alone is the bottleneck.
+Pipelines serve both FC1 and FC2. Async completion and achieved occupancy are
+not measured by these endpoint counters.
+
+Layout-budget estimates: A stage16896bytes; B stage33792bytes. Baseline estimate
+223264 or224800bytes (local/direct configurations); A reduction frees16896;
+B reduction frees33792. All keep tile128x256x128,384threads,512TMEMcols and128workers.
+Less SMEM did not improve joined latency on stable layers.
+Next targeted candidate: A4/B3 (exchange one B for one A, net16896bytes saved),
+with default A3/B4 bracketing and numerical gates. This is only proposed, not run.
+
+Local artifacts: Downloads/nt4-pipeline-side-results.tar.gz,
+Downloads/nt4-pipeline-side-comparison.json. Analysis /tmp/analyze_depth.py.
+No candidate-driven E2E or deployment numerical qualification is implied.
+
+A4/B3 rebalancing queued on new nodes (2026-10-30)
+-----------------------------------------------
+Private NT4_PIPELINE_REDUCE_SIDE=a_plus_b_minus adds one A stage/removes one B
+stage. Baseline A3/B4, candidate A4/B3; net16896bytes lower layout estimate.
+Guard refuses exceeding original estimated SMEM budget or <2 stages per side.
+Compile key includes mode. Default unchanged. CPU policy/syntax tests pass.
+GPU compilation and numerical/graph validation pending at launch.
+
+Tmux0 nvl72d201-T18 job5016262; tmux1 nvl72d010-T09 job5016263.
+Fresh nodes: installed nvshmem4py-cu13==0.4.0 before queue.
+Each runs128workers,2repetitions of serial/overlap control-candidate-control,
+then4 sparse diagnostic arms (both schedules).16arms/node; schedules reversed
+on node1. Same native continuation, advisory, matched inputs and numerical gates.
+No full-model candidate-driven throughput claim. Queue deadline1793394300.
+
+Remote logs under /lustre/fsw/portfolios/nemotron/users/helenn/logs:
+  nt4-pipeline-a4b3-node0-20261030-101000[.log]
+  nt4-pipeline-a4b3-node1-20261030-101000[.log]
+No polling loop; compare resource logs to confirm A4/B3 before interpreting.
+
+TRT scheduler counterpart build on tmux2 (2026-10-30)
+--------------------------------------------------
+Node nvl72d146-T17 job5016446, fresh4h; NVSHMEM0.4.0 installed.
+nt4_fc2_scheduler_twins.sh launches isolated export with4configs: fixed FC1
+clampedrelu2 N32/K256 persistent, and FC2 N32/K256 static/staticPersistent/
+persistent. FC2 option dictionaries are identical except tileScheduler.
+Reuses existing generator build-gb300-public133; exporter records its hash.
+Does not modify generator source or install into running FlashInfer artifacts.
+Exporter correctness checks mandatory;7200s timeout. Preflight PASS GB300.
+
+Export root:
+/lustre/fsw/portfolios/nemotron/users/helenn/logs/nt4-fc2-scheduler-twins-20261030-101503
+Sibling .log captures progress. Export is a prerequisite, NOT matched-input timing.
+Next after successful validation.json: audit emitted metadata/scheduler code and
+launch-grid behavior, then adapt isolated replay to select new export/config IDs
+by inspected metadata. Keep FC1 fixed, match common activation/scales/output hashes
+on four captured ranks, CLC/static-persistent/CLC brackets (ordinary static also).
+Do not reuse old numeric config IDs blindly. Existing replay hardcodes FC1config5
+and defaults FC2config7 from the OLD export; it is not queued against new export.
+Static-persistent has a previously reported scheduler correctness risk; do not
+relax harness checks or present it as CLC-only isolation without code/grid audit.
+
+A4/B4 feasibility: local baseline budget223264+16896=240160bytes vs232448capacity,
+short7712bytes; direct variant shortage9248bytes. No clean spare-budget addition.
+A4/B3 tests continue separately on tmux0/1, unaffected.
+
+TRT scheduler matched replay launched (2026-10-30)
+------------------------------------------------
+Export/harness PASS,4kernels,consumer compile PASS; no shipped-artifact equivalence
+claim. Inspected emitted FC2 metadata: all option fields identical except
+mTileScheduler. Actual names: schedS (static,config1), schPsx3 (static-persistent,
+config2), schPdx3 (CLC,config3). FC1config0 fixed clampedrelu2 N32/K256 persistent.
+FlashInfer runner passes physical SM count into generated bmm.run; generated
+interface selects fixed grid for StaticPersistent. Replay records actual CUDA
+graph kernel grid/block/sharedMemBytes, and asserts scheduler name before timing.
+
+Tmux2 now runs nt4_fc2_scheduler_replay.sh:
+logs/nt4-fc2-scheduler-replay-20261030-102210
+Each of4captured ranks: CLC/static-persistent/CLC/static/CLC.
+Same FP8 activation/scales/output hashes required. Existing independent1.5% gate
+and graph-isolation checks remain unchanged. PDL disabled.20process arms stop at
+first failure. New export has its own content-hashed JIT module; no installation
+over tmux0/1 artifacts. Initial CLC process may compile the new binding.
+nt4_expert_stage_replay.py gained optional export/FC1-config parameters; defaults
+retain old export and config5/7. New output includes launch geometry.
+GPU replay results pending. Native harness pass alone does not prove NT4 replay.
+
+TRT scheduling result: static-persistent control completed (2026-10-30)
+--------------------------------------------------------------------
+All20 replay arms PASS_TRT_STAGE_REPLAY. All4 rank comparison files report
+MATCHED_INPUT_OUTPUT_PASS: same common activation/scale and FC2 output hashes
+within each workload across all modes. Existing independent1.5% numerical gate
+passed; no tolerance changes. PDL disabled, isolated FC2, layer32 captured workload.
+
+Rank  static_us static-persistent_us CLC_us
+0     41.005    41.208               36.949
+1     41.011    38.876               34.587
+2     48.004    45.724               42.039
+3     36.955    36.932               32.672
+CLC column is median of3 control medians. Using adjacent bracketing CLC controls,
+latency reduction vs static-persistent is10.20%,11.02%,8.15%,11.50%; vs ordinary
+static9.91%,15.89%,12.24%,11.65%. CLC end/start drift -0.34%,-0.56%,+0.63%,-0.21%.
+
+Launch geometry captured: static-persistent152x1x1; static and CLC6x284x1.
+All512threads/CTA. Dynamic shared memory: static139792bytes, static-persistent
+139840, CLC139920. Emitted option fields differ only in mTileScheduler. Grid
+and generated scheduling code necessarily differ, so this is a scheduling-mode
+comparison, not an isolated PTX-instruction latency/overhead experiment.
+Persistence alone does NOT explain the measured CLC-mode benefit. Dynamic work
+assignment is supported as a contributor; no full explanation of TRT-vs-MegaMoE
+or E2E improvement follows. Rank workloads replayed sequentially on one GPU,
+not simultaneous EP4 execution. Static-persistent gains over static vary by rank.
+
+Local artifact Downloads/nt4-fc2-scheduler-replay-results.tar.gz contains summaries
+and4comparison files; extracted /tmp/nt4-scheduler-results. Remote root as above.
+Tmux2 returned exit0 and is idle. No new workload launched during result readout.
+
+MegaMoE dynamic-assignment x narrow-tile matrix (2026-10-30)
+---------------------------------------------------------
+Tmux2 launched nt4_fc2_dynamic_tiles.sh after TRT replay completed.
+New --fc2-experiment geometry_atomic in isolated expert replay crosses:
+  tileN256/128 x group128/512/1024 x static/atomic_counter =12candidates.
+Four captured rank workloads,128and152workers on same node. Original wide-tile
+control brackets each matrix, and unchanged TRT FC2 timed before/after.
+All candidates include identical load-balance-counter zero kernel in captured
+replay. All-ready FC2 counters initialized outside graph. Exact output versus
+wide static control, NaN-poison eager/graph checks, independent reference gate,
+and post-timing exact output check retained. Stop at first failure.
+Hardware tanh remains fixed in MegaMoE FC1 baseline; measured FC2 consumes identical
+common post-activation bytes/scales. This does not measure a tanh speed benefit.
+
+Crucially: dynamic assignment here is existing software atomic_counter mode,
+NOT hardware CLC. Lean NT4 compute kernel explicitly rejects force_static_sched=False.
+An atomic loss cannot falsify a CLC gain; it includes global-atomic overhead and
+existing traversal/filtering. Results only motivate candidates for real CLC and
+fused FC1/FC2 integration. No CLC implementation or fused correctness claim yet.
+Only replay script/new queue changed; tmux0/1 model queues unaffected.
+Per-process timeout1800s;8processes. Check printed root in tmux2 for path.
+
+Dynamic-assignment x tile matrix completed (2026-10-30)
+-----------------------------------------------------
+nt4-fc2-dynamic-tiles-20261030-103708 completed8/8cases (4ranks x128/152workers),
+12variants/case =96candidate configurations passed eager/graph exact outputs,
+NaN poison, unchanged independent gate and post-timing output checks.
+Static-control end/start drift <=1.36% in magnitude.
+
+Best within each category,128workers, rank0..3, microseconds:
+wide static: 42.190,43.269,45.066,42.535 (group128 all)
+narrow static: 38.935,39.124,43.592,41.101 (group128 all)
+narrow atomic:47.116,48.367,50.515,46.577 (group512,128,128,128)
+Thus best atomic is13.3–23.6% slower than best narrow static at128workers.
+At152workers atomic vs best narrow static ranges7.7% slower to5.1% faster;
+rank0/1 improvements0.37%/2.68%, rank2 regression7.71%, rank3 improvement5.06%.
+No robust dynamic-atomic win. Selected per-workload minima require confirmation,
+not an adaptive dispatch prescription. Group128+workers128 static is consistently
+strong here; the worker/group interaction deserves preservation in comparisons.
+
+TRT CLC FC2 same-run controls about37.03,34.77,42.33,32.78us at128worker cases.
+Mega measurements include identical load-balance-counter zero kernel in EVERY
+candidate graph; TRT stage timing does not. Counter-fill-only is a different
+counter fill (readiness array), so DO NOT subtract its timing as if it measured
+lb.zero_(). Also Mega retains scheduler traversal with FC1 stages filtered.
+Therefore raw TRT-vs-Mega times here are diagnostic scopes, not pure GEMM apples-
+to-apples and not E2E. Hardware tanh unchanged; FC2 input bytes common.
+
+Conclusion: narrower tiles help these isolated cases, global atomic assignment
+is not a reliable replacement for hardware CLC. This does not disprove CLC in
+MegaMoE. Before fused integration, actual CLC needs a separately validated ready-
+work mapping and launch protocol; no implementation or causal explanation of the
+atomic loss is established by this matrix alone.
+Artifact Downloads/nt4-fc2-dynamic-tiles-results.tar.gz; extracted /tmp/nt4-dynamic-results.
+Tmux2 idle, exit0. No follow-on run launched during this readout.
+
+2026-10-30: actual CLC prototype (not software atomic assignment)
+Owned shim scheduler_fc2_clc.py wraps the existing FC12 broadcast pipeline.
+Uses PipelineClcFetchAsync + cute.arch.issue_clc_query/clc_response.
+Only local, all-ready FC2; single-CTA clusters; no token communication, no
+FC1 execution, no fused/E2E claim. Native production defaults unchanged.
+First implementation scheduled combined FC1/FC2 IDs (discarding FC1) and reset
+the group decoder on every claim: all four captured-rank checks passed, but
+rank0 was 116.88us vs narrow-static 38.96us. This is NOT evidence against CLC:
+it schedules many unused IDs and introduces repeated full group scans.
+Root: nt4-fc2-clc-20261030-105010.
+Second implementation launches only actual FC2 IDs. Static and CLC variants
+share an order-independent prefix-sum decoder (including token/SF padding and
+FC1 counter indexing). Static uses a strided persistent grid; CLC launches
+one block per FC2 tile, claims initial blockIdx then cancels pending blocks.
+CLC is NOT capped to --workers; that flag controls the static arms only.
+Host grid count is exact for the fixed capture; changed routing is not yet
+supported/qualified. Kernel math, N128 geometry, and common input bytes stay
+fixed. Tests: independent numerical gate, exact eager output, NaN-poisoned
+graph replay, post-timing exact equality; all four captured ranks. No tolerance
+changes. PTX retained node-locally and checked for clusterlaunchcontrol.try_cancel.
+Launcher nt4_fc2_clc.sh; tmux2. launch3.log contains refinement root/status.
+
+CLC FC2-only result: nt4-fc2-clc-20261030-105320 completed all four ranks.
+Exact eager/poisoned-graph/post-timing output checks PASS. PTX audit confirms
+clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128.
+Times (us), old narrow-static faster bracket vs FC2-only CLC:
+rank0 38.933 -> 34.898; rank1 38.978 -> 35.231;
+rank2 43.296 -> 37.645; rank3 41.012 -> 34.260.
+9.6-16.5% lower isolated FC2 latency, NOT fused or E2E. New mapping + launch
+geometry are confounders. Fixed common input bytes; activation not timed.
+Added fc2_grid control: same FC2-only decoder and exact launch grid but no CLC.
+Initial matched-grid run (105513) had expensive static termination scans;
+superseded/interrupted, do not use for definitive CLC attribution.
+Corrected static sentinel uses known total FC2 tile count (same information
+used to construct the CLC launch grid). Launch5 runs on tmux2, compares
+persistent-static 128/152 workers, grid-static, CLC, and existing fused-decoder
+static; brackets controls and records graph grid/block/shared-memory/register
+metadata. The CLC launch has no fixed worker cap. Other tmux queues untouched.
+
+2026-10-30 corrected CLC comparison COMPLETE: nt4-fc2-clc-20261030-105739.
+All 8 replay cases / 56 candidate arms PASS captured-input checks.
+Times us: rank, original narrow static128 (faster bracket), FC2-only static152
+(faster bracket), same-grid noCLC (faster bracket), CLC from152-control run:
+0, 38.942, 34.853, 45.147, 35.171
+1, 39.060, 35.731, 45.864, 36.039
+2, 43.585, 37.864, 47.227, 38.606
+3, 41.046, 34.611, 44.823, 34.842
+CLC beats same-grid nonpersistent by ~18-22%, but approximately ties
+corrected FC2-only static persistent152 (CLC 0.7-2.0% higher latency versus
+faster bracket; small relative to drift). Thus earlier 10-16% benefit vs old
+static kernel is not uniquely attributable to CLC. FC2-only decoding and
+removing skipped FC1 scheduling are sufficient to obtain similar performance.
+Graph audit: both same-grid arms 256 threads, 219008 dynamic shared bytes,
+70 compiler-reported registers; grid216-288 blocks depending on capture.
+Static persistent152 uses same resources, grid152. CLC not worker-capped.
+Same readiness/input bytes and exact output. Diagnostic FC2 only; no mixer,
+no communication, no fused FC1/FC2 or E2E conclusion. Do not claim TRT beaten
+from these differing timing scopes (Mega includes common lb.zero kernel).
+Next useful target: reduce fused scheduler traversal overhead while preserving
+FC1->FC2 readiness; retain CLC as an option, not a demonstrated extra speedup.
+
+2026-10-30 fused grouped-lookup scheduler prototype:
+NT4_SCHED_LOOKUP=1, default off with separate compile key. Owned shim only.
+No MCore changes. Static single-CTA clusters, 128 local experts.
+Preserves original group_hint greedy boundaries, linear work IDs, static
+worker assignment and readiness peeks. Scheduler warp builds a 2KiB shared
+prefix table after routing sizes are ready, replacing serial expert traversal
+with direct binary searches. Does NOT introduce CLC or move FC1/FC2 launches.
+Qualification nt4-fc12-lookup-w152-20261030-111126: all 4 captured ranks PASS
+exact FC1 bytes/scales and final FC2, poisoned intermediates, graph and
+post-timing equality. Both arms use the existing isolated replay's hardware
+tanh setting; no numerical tolerances changed.
+rank0/summary.json: control 69.404us, lookup 61.410us, latency reduction 11.52%.
+rank1/summary.json: control 65.780us, lookup 58.353us, latency reduction 11.29%.
+rank2/summary.json: control 73.445us, lookup 65.531us, latency reduction 10.78%.
+rank3/summary.json: control 62.786us, lookup 53.793us, latency reduction 14.32%.
+E2E launched tmux2: nt4-lookup-e2e128-20261030-111400.
+128 OpenMath requests x512 generated tokens, 2 measured rounds/arm, model
+graphs, shortcut overlap, controlled GC, detached tail, group1024, uncapped
+workers (152 on GB300). Accurate/default activation in BOTH MegaMoE arms:
+NT4_HARDWARE_TANH and advisory are unset. Candidate drives actual generation.
+Arms CUTLASS-start, Mega-control-start, Mega-lookup, TRTLLM, Mega-control-end,
+CUTLASS-end. Existing numerical/graph gates retained; extra exact-generation
+check compares candidate and both Mega controls. No branch timing/native
+continuation. Launch log nt4-lookup-e2e-launch.log. E2E outcome pending.
+
+2026-10-30 tmux0/1 A4/B3 queues COMPLETE (16/16 arms each, all returncode0).
+Roots nt4-pipeline-a4b3-node{0,1}-20261030-101000. Both panes idle.
+Control A3/B4 vs candidate A4/B3, workers128, 2 repeats/node, opposite
+serial/overlap ordering. Non-sparse timing: matched input hashes and identical
+(rank, round, sample, layer) key sets verified. Statistics below are median
+per-rank/node/repeat relative changes against faster bracketing control,
+not pooled E2E throughput. Sparse arms excluded from performance comparison.
+Layer32: serial expert +1.84%, join +0.62%; overlap expert +2.29%, join +0.64%.
+Layer68: serial expert +2.06%, join +0.75%; overlap expert +0.59%, join +0.82%.
+Layer68 overlapped mixer-post/shared tail -3.95% (range -6.15 to -2.36%), but
+join does not improve. Thus resource redistribution helps this tail slightly
+without delivering whole-block improvement. Do not select A4/B3 as winner.
+Layer7 join is dominated by large run/rank skew; bracketing drift tens to
+hundreds of percent, unsuitable for judging this small scheduling effect.
+Archives local Downloads/nt4-a4b3-summaries.tar.gz and nt4-a4b3-branches.tar.gz.
+No new runs launched on tmux0/1 during this inspection.
+
+2026-10-30 parallel follow-ups launched while lookup E2E runs on tmux2:
+- tmux0: nt4-lookup-workers-20261030-113000. Four captured ranks, workers
+  152 -> 96 -> 128 -> 144 -> 152, group1024. 20 fresh-process cases.
+- tmux1: nt4-lookup-groups-20261030-113000. Four ranks, workers152,
+  groups128/256/512/1024/2048 forward then reversed. 8 cases, each group has
+  original-control -> lookup -> original-control. Exercises multiple groups.
+Dedicated copied replay nt4_lookup_tune_replay.py uses original exponential
+activation by default, matching the current E2E; previous isolated replay used
+hardware tanh. Do not directly compare cross-run absolute timings. Existing
+exact FC1 bytes/scales, FC2, poisoned graph checks retained; stop on failure.
+These measure fused compute only, NOT mixer contention or E2E. Goal: identify
+worker/group candidates for a subsequent full-model comparison. No changes
+made to kernel sources or tmux2's active E2E harness for these two queues.
+Deadline2h from launch, finite trials, no Slurm/filesystem polling loops.
+
+2026-10-30 completed lookup tuning + first SASS interpretation
+- Workers queue nt4-lookup-workers-20261030-113000: 20/20 PASS_FC12_CONFIRM.
+- Groups queue nt4-lookup-groups-20261030-113000: 8/8 PASS_FC12_CONFIRM.
+- Original exponential tanh, captured isolated expert workload; not E2E.
+- 152-worker group1024 lookup reductions vs faster bracketing original controls: rank0 9.81–9.87%, rank1 11.92–11.97%, rank2 12.94–13.00%, rank3 12.98–13.07%.
+- Lookup median us, workers96/128/144/152: rank0 78.045/67.807/66.917/66.344; rank1 75.299/66.019/64.430/61.924; rank2 87.359/77.179/71.646/69.695; rank3 71.788/61.523/59.391/59.379. 152 values average start/end runs.
+- Groups1024/2048 effectively tied across forward/reverse runs (<0.1us difference in per-rank means). Keep1024; no standalone reason to cap workers.
+- SASS archive nt4-sass-turnover-20261030-113720: four same-build scheduler twins, NOT every E2E-selected tactic. Local /tmp/nt4-turnover-analysis/assembly.
+- FC2 CLC disassembly: UTCQMMA at0x2960..0x2b60, UTCBAR after; epilogue waits0x33c0/0x33e0, LDTM at0x3430/0x3440, DEPBAR0x3460, BF16 packing then UTMASTG at0x3700/0x3730. Next-work SASS is UGETNEXTWORKID.SELFCAST/BROADCAST (not named CLC). Do not interpret address order across warp-role branches as execution chronology.
+- Static-persistent and CLC twins both have8 static UTCQMMA sites,2 LDTM sites,2 UTMASTG sites. This supports common arithmetic/store machinery, not identical dynamic execution counts.
+- CLC reports REG128/LOCAL0/STACK0 and uses USETMAXREG deallocation/allocation; spills are not demonstrated in this artifact. Register report alone cannot infer occupancy with dynamic redistribution.
+- Mega source: A/B try_wait then acc producer_acquire; default next-stage peek before issuing ready MMA; epilogue overlapping accumulator release after first subtile, while mixed-width/late-release holds until all reads. Already has early release: do not claim TRT uniquely overlaps accumulator reuse.
+- Missing proof: map TRT barrier addresses to each role/stage and accumulator recycling; determine whether next-work request latency actually lies on critical path. Static instruction count or address order cannot establish this. No new runtime-stall claim made.
+
+2026-10-30 all-ready FC2 synthetic routing result
+Roots nt4-fc2-imbalance-node{0,1}-20261030-115506. All8 cases PASS_FC2_CLC_DIAGNOSTIC (7 variants each). Fixed32 nonempty experts,192 M128/N128 tiles; useful local contributions per rank960/1264/1836/1060. Balanced expert counts30/39-40/57-58/33-34; skewed counts1..128. Static below is faster bracketing FC2-only static control,152workers.
+rank balanced static/CLC us; skewed static/CLC us:
+0 26.639/26.654;26.737/27.362
+1 26.587/26.662;28.562/28.697
+2 27.766/28.575;28.715/28.717
+3 25.594/25.975;26.782/26.836
+No CLC win. Balanced rank2/3 control drift2.67%/3.14%; do not interpret small losses there. Skewed drift<=0.41%,CLC0.01..2.34%slower.
+LIMIT: skew in useful rows is not necessarily skew in worker service time: every expert still needs one128row M tile, identical K and N. Only192tiles/152workers; allinputsready. This does NOT refute CLC benefit under varying tile costs or producer-readiness skew. No individual CTA finish timestamps measured. Stronger load-imbalance claim requires verified worker-tail imbalance, not just skewed routing counts.
+Local summaries /tmp/nt4-imbalance-results; archive /tmp/nt4-imbalance-results.tar.gz.
+
+2026-10-30 controlled service-time diagnostic launched
+Roots nt4-fc2-service-node{0,1}-20261030-120209, ranks0/2 respectively. Delays0,20000,100000ns; static workers152 vsuncappedCLC, bracketing static plus separate static/CLC trace arms. Captured FC2 inputs, unchanged math and numerical gates.
+Independent snapshot kernel_fc2_service_stress.py and runner nt4_fc2_service_stress.py; active kernel_mxfp8_glu_fc12.py untouched. MMA warp spins before tile work when FC2 linear tile ID modulo152<8. Deliberately concentrates costly work onto8 static assignments; artificial service-time stress, NOT measured production skew. Timestamped copies write fullCTA start/end after final CTA rendezvous; trace tensor zeroed each trace launch, cancelled CTAs remain zero. Performance comparisons use non-trace arms; trace arms include extra memset/stores/barrier and are not speed claims. No asynchronous producer-ready emulation. No claim of E2E benefit.
+Initial imports/reference stages started; GPU compile/validation still pending when recorded.
+
+2026-10-30 controlled service-delay and worker-count results
+All6 service cases and8 worker cases PASS_FC2_CLC_DIAGNOSTIC. Download /tmp/nt4-service-results.tar.gz, extracted /tmp/nt4-service-results.
+Uninstrumented FC2 static(faster bracket)/CLC us:
+rank0 delay0=35.026/35.168;20us=60.052/59.544;100us=219.344/219.282.
+rank2 delay0=37.403/38.031;20us=61.481/61.474;100us=219.297/219.296.
+100us trace max-minus-median CTA completion: rank0 static190.976us/CLC190.944us; rank2 static188.144us/CLC188.512us. Static CTAs0..7 take~214us; CLC rank0 CTAs0..5 still~214us, CTAs6/7/8/9~115-117us. Rank2 most0..7 still~214us. Tail is real, CLC does not remove it; some redistribution is consistent with traces.
+Source scheduler warp publishes current work then immediately gen_next_work(), with scheduler stages2; CLC gen_next_work claims cancellation before the next publish backpressure. Thus claim can run ahead of compute completion. Likely explanation: much of the small backlog is claimed while initial heavy tiles still compute. Claimed work cannot be stolen by CLC. This is an inference from source + CTA durations, not exact per-tile ownership proof (not recorded yet).
+Next discriminating experiment: compare eager claims with compute-progress-gated/bounded claims, trace tile ownership and claim times separately; include no-delay control to quantify lost prefetch overlap. Do not infer CLC intrinsically cannot balance workers from this implementation.
+Worker-count synthetic routing: 96-static versus uncappedCLC also no win; CLC ranged0.02..5.29%slower.152-static CLC0.33..3.36%slower in this node. No reason to cap static workers from these isolated tests. These are all-readyFC2/artificialservice experiments, not E2E.
+
+2026-10-30 gated-claim queues + lookup E2E
+Gated queues nt4-fc2-claim-gate-node{0,1}-20261030-120723 runrank0/2,delay0/20/100us. Separate kernel_fc2_claim_gate.py and nt4_fc2_claim_gate.py. Gate release after current tile MMA issuance/accumulator commit (NOT epilogue completion); scheduler acquire-load waits before next CLC claim. Per-CTA64bit release/acquire progress counter. Identical trace-buffer zero reset in every main comparison graph. Eager/gated/static uninstrumented latency, separate tracearms with tile->CTA and compute-start timestamps (not claim timestamps), CTAstart/end. Default/reference snapshot unaffected. rank0zero-delay completed numerical checks; gated~47.48us vsstatic~36.90us, demonstrating no-delay prefetch/gating penalty. Fullqueues still running at entry.
+E2E nt4-lookup-e2e128-20261030-111400:5armsPASS,TRTclampedFAIL SIGSEGV rank0 prior to measuredround. No overallsummaryvalidity/comparisonagainstTRT. Preserved results: CUTLASSstart9213.67/end9275.23tok/s; hybridoriginalstart10000.44/end10062.75;lookup10173.09 (mean2measuredrounds each). Lookup+1.10%vsfasterhybridcontrol.128requests,512generatedtokens,wholemodeldecodegraphs,shortcutoverlap,controlledGC,originalexponentialtanh.
+Manually checked outputs-round1/2 for hybrid-control-start/hybrid/hybrid-control-end against control-start round1: all128/128requestsequencesexact in all6files. Each measuredarm graph-vs-eagerEXACT. Overall script abort preceded normal cross-arm analysis, hence manual read-only check. TRT failure root not diagnosed beyondSIGSEGV; do not silently classifyascleanupfailure. Local logs /tmp/lookup-e2e-logs.
+
+2026-10-30 gated CLC result
+All6casesPASS. Uninstrumented static/eagerCLC/gatedCLC us:
+rank0delay0 36.897/36.913/47.483;20us61.491/61.479/55.262;100us221.202/221.159/135.187.
+rank2delay0 38.954/38.974/49.253;20us63.257/62.981/55.093;100us221.171/221.134/134.005.
+Gate reduceslatency10.1–12.5%at20us,38.9–39.4%at100us versus eagerCLC; costs26.4–28.6%atzerodelay. Includes identicaltracebufferreset in comparedgraphs.
+Ownershiptraces:16delayedtiles. Static assigns2eachtoCTAs0..7. EagerCLC mostlysame (a fewredistributed). GatedCLC under20/100us assigns1eachto16distinctCTAs. Strong evidence that claimtiming controls redistribution in this diagnostic. Trace maxCTAend drops~214usto127–128us at100usdelay; do not equatetraceinstrumented timeswith latencyarms. Controlled/artificialdelay; noE2Ewinclaim. Candidateproposal: intermediate/earliercomputeprogressgate or boundedlookahead; must retain no-delaycontrol and verify natural imbalance before deployment.
+
+TRT E2E failure root clarified from log:
+Firstfailure is layer14rank0 check_fused_helpers -> compare AssertionError, before segfault. Local expert contributions recombined on that PE vs independent FP32/quantized PyTorch reference. global_rel_l2=.0022564356 (0.22564%), max_row_rel_l2=.0157684069 (1.57684%) exceeds .015 perrowlimit, max_abs=.1123561859, worstrow77; finite. Savedcomplete failure.pt834471618bytes andmanifest at trtllm-clamped/numerical-failures/rank0-1793385911671970198. Afterexception logs destroy_process_group-not-called thensegfault. Native teardown culpritnotidentified; no evidence fromthislog of GPUillegalaccess. Numericalgatecausedrunfailure, secondarySIGSEGV obscuredexitcode. Noacceptancecriterialoosened, no rerunlaunched. Snapshotreadyforsingle-layerreplay.
+
+2026-10-30 user authorized exploratory TRT speed comparison despite recorded numerical rejection.
+Launched tmux2 via nt4_trt_lookup_exploratory.sh; launch log nt4-trt-lookup-exploratory-launch.log. Fourarms tunedCUTLASSstart -> lookuphybrid -> TRTclamped -> tunedCUTLASSend;128requests,512tokens,2measuredrounds,fullmodeldecodegraphs,shortcutoverlap,controlledGC. NT4_SCHED_LOOKUP=1 preserved forhybrid. --trtllm-exploratory-timing sets TRT-onlynumericalexceptionmode; originalthresholdsunchanged, finite/zero-rowchecksretained, candidateoutputsdrivegeneration. TRT qualificationNOT_PASSED;exceptionsloggedEXPLORATORY_ONLY, never qualifieddeploymentclaim. Priorlayer14rank0failuremanifest remains errortrackinganchor (global0.2256%,worstrow1.5768%,limit1.5%).
+
+2026-10-30 first-MMA-issue claim test launched
+Roots nt4-fc2-claim-point-node{0,1,3}-20261030-121431.0/1ranks0/2delays0,20,100us.3ranks1/3zerodelaytwiceeach.Independent snapshots kernel_fc2_claim_point.py + nt4_fc2_claim_point.py. Compare static,eagerCLC,firstKtileMMAissuegatedCLC,lastMMAissuegatedCLC,eagerend,staticend;separatetracearms. Firstissue signals progressafterfirstcute.gemm call,beforeA/Bstagerelease. It doesNOTwaitforhardwareMMAcompletion. Zero-delay repeatedcaptureson3 guardagainstoptimizedartificialdelayplacement. Allchecksunchanged;commontracebufferresetincludedinlatencyarms. Tmux2exploratoryE2Euntouched.
+
+2026-10-30 first-issue claims results tmux0/1
+All6casesPASS. EagerCLC fasterbracket /firstissue/lastissue us:
+rank0delay0 36.909/39.061/47.269;20us61.473/47.228/55.176;100us220.922/127.205/134.845.
+rank2delay0 38.986/40.933/49.211;20us62.226/47.138/54.511;100us221.133/127.086/133.533.
+Eagerbracketdrift<=0.05%. Firstissuecuts20usdelaylatency23.17–24.25%,100us42.42–42.53%,butzerodelaycost4.99–5.83%. Trace16expensivetiles spreadoneeachonto16CTAsunderfirstissueandlastissue; eagermostly2perCTA. Trace maxCTAend firstissue~40us(20usdelay),120–121us(100usdelay),vs eager~55–56/~214–215us. Firstissue preserves more pipeline overlapthanlastissue but stilldoesnotwinunchangedworkload. ArtificialdelayplacedbeforefirstMMAfavorsfirstissuegate: no inference deploymentclaim. Tmux3unchangedranks1/3replicatesnotreadinthisturn. Archive /tmp/nt4-point-results.tar.gz.
+
+2026-10-30 tmux3 firstissue no-delay repetitions
+Root nt4-fc2-claim-point-node3-20261030-121431;all4PASS. Static/eagerCLC/firstissue/late us:
+rank1rep1 37.056/36.957/39.211/47.271;rep2 37.073/36.938/39.228/47.268.
+rank3rep1 34.904/35.088/38.281/45.977;rep2 34.905/35.092/38.135/45.807.
+Firstissuecost6.10–6.20%rank1,8.67–9.10%rank3vsfastereagerbracket;control drift<=0.175%. Acrossall4capturedranksfirstissuegatingregressesunchangedworkload5–9%. Keepstaticlookupdefault;CLCbalancingmechanismdemonstratedonlyunderartificialserviceimbalance. Furthergatingoptimizationnotjustifiedasdeploymentdefaultwithoutnatural-worker-tail evidence. Globalprogresscounter synchronization is partofprototypecost; no proofallCLAIMpoliciesintrinsicallypaythiscost.
+
+2026-10-30 stage-attribution launched while exploratoryE2Eruns
+Roots nt4-stage-attribution-node{0,1,3}-20261030-122328. Separate nt4_lookup_stage_attribution.py;kernelssourcesunchanged.0ranks0/2,1ranks1/3 original->lookup->original,group1024workers152exponentialtanh.3all4rankslookup-exp->lookup-hardwaretanh->lookup-exp. IsolatesFC2commonTRTbytes/scales,FC1owninput,FC12; repeatsFC2andTRTFC1/FC2controls. FC1exactbytes/scalesvsownfusedhandoff,FC2independentprovisionalandpoisonchecks,graph/eagerchecksretained. Hardwareactivationnotnumericallyidentical;ownhandoffvalidationdoesnotqualifyfullmodelactivationchange. Mega stage timesinclude countersreset and skippedstageenumeration; TRTisolatednodesPDLoff. Never sumisolatedFC1+FC2asfusedorE2Eprediction. Dedicatedparserdefaultoriginaltanhfalsehardwareflag. Localpy_compilepass;initialGPUrunsstarted,notyetread.
+
+2026-10-30 attribution harness repair
+Initial122328queuesfailed lookupconstructor beforecompile: missingstatic_expert_shape. Added static_expert_shape=(128,4096,768)toinitialstage0/1/2Kernel constructorsforBOTHoriginalandlookuparms. Originalguardunchanged. NoCUDAillegalaccess/numericalrejectioninthisfailure. Restarted fresh nt4-stage-attribution-node{0,1,3}-20261030-122643;previouspartialresultsnotusedasmatchedcontrols. Sourcekernelandtmux2untouched. Pythoncompilepasses;GPUqualificationpending.
+
+2026-10-30 completed stage attribution node0/1
+All12armsPASS_PROVISIONAL_FC2_AND_REPLAY_CHECKS;commonactivation/scalehashesmatchperrank acrossoriginal/lookup/originalend. BracketingMega stagedrift<=0.36%.
+Original(fasterbracket)->lookupus,FC1/FC2/fused:
+r0 53.298->45.754;53.301->37.065;71.910->65.337.
+r1 51.148->43.861;53.189->36.650;68.558->60.963.
+r2 55.769->49.195;55.315->41.952;78.720->68.322.
+r3 47.159->37.102;49.182->30.760;67.461->58.177.
+FC1saving11.79–21.33%,FC224.16–37.46%,fused9.14–13.76%. Stagefilterstilltraversesskippedphase;isolationamplifiesschedulerbookkeepingcost.Donotaddisolatedsavings.
+TRT fasterstart/endFC1/FC2uswithinlookuparm:r0 35.346/37.047;r1 37.489/34.616;r2 43.759/42.081;r3 34.312/32.627. RemainingobservedstagegapconcentratedFC1;MegaFC2similarrange, butMega includescounterresetandskippedstagebookkeeping,TRTisolatedkernelPDLoff,so not perfectlyequalrawkernelscope. OriginalexponentialtanhMega;TRTclampednativeactivation. Waitnode3activationattributionbeforeassigningFC1gaptoactivationvsGEMM. Archive/tmp/nt4-attribution-results.tar.gz.
+
+2026-10-30 combined lookup + hardware tanh follow-up:
+E2E root nt4-lookup-hardware-overlap128-20261030-123710 failed during layer20 validation before candidate timing: original-reference expert max relative L2=0.0412413068 vs 0.015 gate. Recombined independent-reference global relative L2=0.00045282484, worst row=0.00311550195. FC1 advisory exception expert18; downstream per-expert gate remained fatal. Subsequent segfault is after assertion, not established as initial failure. No E2E win established.
+Matched roots serial nt4-lookup-tanh-matched128-serial-20261030-124155 and overlap nt4-lookup-tanh-matched128-overlap-20261030-124020: all four arm summaries and 384 records/arm present; input hashes identical for all 384 rank/layer/round/sample keys across eight arms. Overlap shell reported EOF after final arm (launcher was edited in place while active); do not repeat this. Arm outputs completed.
+Median over matched invocations of max-rank join_us; layer32 serial lookup-start/hardware/TRT/lookup-end=317.41/312.61/313.34/321.10; overlap=238.21/232.03/227.31/238.42. Layer68 serial=405.44/401.39/393.22/408.86; overlap=314.05/308.34/299.70/314.21. Hardware saves 2.59%/1.82% overlap block time vs faster lookup controls, remains 2.08%/2.88% slower than TRT. Layer7 large rank skew/control drift precludes clean attribution. Diagnostic only: native CUTLASS continuation, instrumented phase intervals, not E2E; serial and overlap on different nodes.
+Local archives /tmp/nt4-combined-results.tar.gz and /tmp/nt4-combined-branches.tar.gz; analysis /tmp/analyze_combined.py.
+
+2026-10-30 batch128 exploratory E2E hardware tanh + lookup completed twice:
+nt4-lookup-tanh-exploratory128-20261030-135719: lookup exponential start10262.947, hardware10255.251, exponential end10177.254 tok/s. Hardware -0.075% vs faster control; Mega control drift0.835%. CUTLASS8526.554->9146.197 (+7.27% drift).
+nt4-lookup-tanh-repeat128-20261030-135939: exponential10148.311, hardware10285.074, exponential end10207.370. Hardware+0.761% vs faster control; Mega drift0.582%. CUTLASS8354.578->9219.159 (+10.35% drift). Two measured rounds each,128requests/512tokens,model decodegraphs/shortcutoverlap/controlledGC. All own-eager graph outputs EXACT. Hardware expert exceptions present; no final-output exceptions (final-output gate remained mandatory). Numerically NOT_PASSED_EXPLORATORY. Token sequence agreement against CUTLASS36/128 for hardware vs42/128 exponential; not task accuracy. No robust E2E hardware-tanh win; CUTLASS-relative speed ratios invalid under >3% drift. Archives /tmp/nt4-tanh128-two-runs.tar.gz. Tmux0 unqualified256 running separately.
+
+2026-10-30: matched full-forward tanh diagnostic (GPU validation pending)
+nt4_matched_forward.sh records then brackets hardware tanh with exponential
+lookup controls at 128 requests. All 28 shortcut blocks snapshot inputs, local
+routed inputs/probabilities/maps and outputs. Replay substitutes saved inputs
+and block continuations; this keeps subsequent blocks and recurrent cache
+updates on the reference trajectory through the sampled prefix. Exact route,
+continuation, and final-logit hashes are mandatory. Every preceding decode in
+that prefix is fixed, including partially occupied steps. The eight full-128
+forwards are timed with CUDA events around the complete controller forward;
+report max rank per invocation. Common snapshot/select/copy work is included;
+CPU staging, checks, sampling and file I/O are outside the timer. Four packed
+rank files are written once and read once per arm (no per-step Lustre I/O).
+This is diagnostic latency, NOT natural generation throughput or numerical
+qualification. Candidate raw outputs are checked for finiteness; existing
+explicit hardware-tanh numerical exceptions remain advisory for this experiment.
+No native second expert computation is inserted. No kernel or MCore changes.
+
+Matched-forward first attempt 20261030-151949 produced NO timings: discovery
+asserted 28 blocks while traversing the complete model (including MTP).
+Fix: enumerate only main decoder MXFP8 shortcut blocks, exclude unchanged BF16
+experts and MTP, reject duplicates/empty discovery, and check instrumented module
+IDs against all executed adapter layers. Log actual discovered layer IDs. Added
+a regression fixture containing both duplicate MTP layer IDs and a BF16 block.
+The earlier "all 28" description was an assumption, not validated coverage.
+
+2026-10-30: completed unqualified hardware-tanh E2E, tmux0
+Root logs/nt4-lookup-tanh-unqualified256-20261030-144103. All five arms
+completed, two measured rounds, 256 requests x 512 output tokens, full decode
+model graphs and shortcut overlap, controlled GC. Mean tok/s:
+CUTLASS start 12578.998, end 12452.076 (1.009% decline);
+lookup exponential start 13514.292, end 13466.897 (0.351% decline);
+lookup hardware tanh 13892.587 (+2.799% against faster exponential control).
+Candidate remains NOT_PASSED numerically: captured final output global rel L2
+0.00078643055, worst-row 0.01984900, max absolute 0.359375. This is the previously
+attributed layer14/token155 FP8 rounding-boundary amplification. All measured
+arms replayed 512 decode graphs per round, generated 131072 tokens. Exact full
+sequence agreement vs CUTLASS: exponential 95/256, hardware 97/256 (not answer
+accuracy). Different generated tokens/routes still confound causal attribution.
+Batch128 repeats on tmux2/3 remain +0.761%/-0.075% against faster exponential
+controls (control drift 0.582%/0.835%); no consistent batch128 E2E win. No matched
+TRTLLM arm in these tanh runs; do not compare 13892.6 directly to prior-node TRT
+13747.5 to claim a win. Downloaded summaries/log once under
+/tmp/nt4-tanh-completed-oct30 for local analysis.
+
+2026-10-30: launched combined hardware-tanh/TRTLLM comparison on tmux0/2.
+nt4_tanh_trt_compare256.sh tanh-first|trt-first uses batch256,512 output tokens,
+two measured rounds, controlledGC, full decode graphs, MXFP8 shortcut overlap.
+Six fresh processes: CUTLASS [39,428] start; lookup exponential start; hardware
+and TRTLLM (order reversed on second node); exponential end; CUTLASS end.
+Hardware candidate only receives finite FC1/expert/final-L2 advisory exceptions.
+TRTLLM only receives its existing explicit exploratory numerical policy. Both
+remain NOT_PASSED numerically if exceptions are permitted; generation uses
+actual candidate outputs. No kernel changes or new cubin export. Added support
+for combining --hardware-tanh-confirm and --trtllm-clamped-compare, with
+--tanh-trt-order controlling middle arms. Defaults and matched-forward run are
+unchanged. Syntax and pure-Python arm-order checks pass; GPU runs pending.
+Tmux1 reference recording finished and exponential matched replay was running
+when these comparisons launched. Tmux3 intentionally left idle.
+
+Tmux3 subsequently received a fresh node nvl72d201-T18. Launched
+nt4_tanh_trt_compare128.sh trt-first there: same six-arm comparison as batch256,
+but 128 requests. Installs NVSHMEM if missing. This tests batch dependence of
+hardware-tanh versus TRTLLM with same-node controls; not a numerical qualification.
+Launch log: logs/nt4-tanh-trt128-trt-first-launch.log.
+
+Completed same-node tanh/TRT comparisons, 2026-10-30:
+256 tanh-first (154210): hardware 13707.865 tok/s, TRT 13674.558,
+exponential start/end 13613.899/13446.602. Hardware +0.244% vs TRT;
+exponential drift -1.229%, CUTLASS drift -14.439% (reject clean comparative claim).
+256 TRT-first (154215): hardware 13615.016, TRT 13754.737,
+exponential 13380.789/13431.333. Hardware -1.016% vs TRT, +1.368% vs
+faster exponential; exponential drift +0.378%, CUTLASS -1.091%.
+128 TRT-first (154915): hardware 10194.229, TRT 10360.761,
+exponential 10224.685/10151.837. Hardware -1.607% vs TRT; exponential
+drift -0.712%, CUTLASS +0.143%. Two measured rounds,512 tokens each,
+all measured arms512/512 model graph replays. Both candidate policies explicitly
+NOT_PASSED for numerical qualification. No reproducible hardware-MegaMoE win
+over TRTLLM; batch256 is close and batch128 still behind.
+
+Matched full-forward run152627 completed all arms. Inputs/routes/continuation
+logits matched exactly across recorded prefix. Median max-rank forward times:
+exp-start11380.864us; hardware11286.768us; exp-end11499.312us.
+Hardware speedup1.008337 vs faster control; control drift1.0408%.
+Eight samples, diagnostic snapshot/select/copy overhead included; no throughput
+claim. Effect is small relative to control drift; not proof of a robust gain.
+Summary downloads /tmp/nt4-tanh-trt-results.
+
+Next FC2 experiment: nt4_fc2_lookup_geometry.sh 0|1, split saved rank0/1 on
+tmux0 and rank2/3 on tmux2. Extends nt4_lookup_stage_attribution.py with
+--fc2-experiment lookup_geometry --lookup-enabled. Current lookup N256 controls
+bracket N128 lookup, N128 simplified FC2-static and repeated N256 lookup.
+Identical saved TRT post-FC1 FP8 bytes/scales feed all FC2 kernels; exponential
+activation retained for setup. Existing independent reference, eager/graph exact
+output and poisoned replay checks remain; additionally assert FC2 did not mutate
+any input bytes/scales. 152 workers,200 iterations,5 timing rounds, all-ready
+FC2-only scope. No fused/E2E claim. Mixed FC1-N256/FC2-N128 lookup remains rejected
+by kernel guard; not enabled for this experiment. No kernel-source modifications.
+Only syntax checked locally; GPU qualification pending. Stop on failing rank.
+
+FC2 lookup geometry finished all four ranks PASS (roots part0-20261030-173025,
+part1-20261030-173029). Identical TRT FC1 activation bytes/scales,152 workers,
+all-ready FC2 diagnostic. Median microseconds, rank0/1/2/3:
+N256 lookup variant:37.153/37.385/41.020/30.727
+N128 lookup:42.761/42.846/43.280/38.920
+N128 FC2-only static:34.928/35.015/37.339/34.756
+TRT FC2 start:37.019/34.549/42.313/32.796
+Lookup control start/end drift <=0.113%; TRT <=0.157%. All variant eager/graph
+outputs exact against control; original FC2 output bit-exact with TRT. Input
+bytes and scales unchanged. N128 lookup loses all four workloads; simplified
+static improves ranks0/1/2 but regresses rank3 (~13%). Largest saved workload
+rank2 gains~9% versus N256 lookup, but this is not a measured EP critical path.
+FC2-only static assumes all FC1 ready; cannot directly deploy in fused scheduler.
+N256 lookup already beats TRT FC2 on ranks2/3. No evidence for universal narrow
+tile change or a universal raw-FC2 TRT advantage. Any fused adaptation must retain
+FC1 readiness and prove the gain survives overlap; do not treat this as E2E win.
+
+Fused follow-up prototype: scheduler_single_group (opt-in, no frontend default).
+Owned kernel_mxfp8_glu_fc12.py and scheduler_group_lookup.py only. Same static
+worker stride, one lookup prefix table, but one global logical FC1 region followed
+by FC2 instead of repeated expert-group FC1/FC2 regions. Skips repeated group
+boundary searches; retains existing work enrichment, publication, counter checks,
+producer/consumer pipelines and epilogues. This is NOT the all-ready FC2 scheduler
+and NOT CLC. It may lose useful stage overlap, so speedup is not assumed.
+Each worker's FC1 tiles precede its FC2 tiles; no global grid barrier added.
+Launch nt4_fused_single_group.sh on tmux3 (2h remained vs~20min on other nodes).
+Saved ranks2,0,1,3 sequentially. Current grouped N256 lookup controls bracket
+single-group N256, grouped N128, single-group N128. Full fused stage0, exponential
+activation,152 workers,200 iterations. Original eager/graph, exact FC1 bytes/scales,
+poisoned intermediate replay checks remain fatal. Results diagnostic only;
+no communications or E2E qualification. CPU syntax passes, GPU validation pending.
+
+Single-group first attempt173642 failed during candidate construction: N128 is
+allowed by the owned kernel only for diagnostic_stage2, not fused stage0. No
+candidate timing or correctness rejection occurred. Harness corrected to compare
+only supported N256 grouped controls versus N256 single-group, isolating schedule.
+Geometry guard unchanged. Restarted tmux3 with retry launch log; GPU pending.
+
+Single-group retry173819 completed PASS all ranks. Fused us start/single/end:
+r0 66.697/66.340/66.269; r1 62.737/61.989/61.941;
+r2 69.818/69.623/69.645; r3 59.548/59.320/59.318.
+No convincing benefit vs faster grouped control. Exact intermediate and final
+checks passed. New nodes0/1/2 run nt4_fused_worker_headroom.sh 96/128/144,
+respectively. Each node repeats152 and target workers on each saved rank2,0,1,3,
+with grouped-start/single-group/grouped-end at each count. This measures compute
+capacity cost of leaving resources available; no simultaneous mixer or E2E claim.
+NVSHMEM installed if absent. No further kernel changes. Results roots
+nt4-fused-headroom-w{96,128,144}-<timestamp>.
+
+Tmux3 reused for nt4_tanh_trt_compare512.sh trt-first, with ~1h58 allocation
+remaining. Same six-arm E2E protocol as128/256, now512 requests x512 generated
+tokens; budget2048,2 measured rounds,MXFP8 full decode graphs,shortcut overlap,
+controlledGC. Current grouped lookup,152workers,detachedtail; new single-group
+scheduler NOT enabled. TRT and hardware-tanh numerical policies explicitly
+exploratory/unqualified. Check actual occupancy and control drift before claims.
+No library edits; new wrapper only. Launch logs/nt4-tanh-trt512-launch.log.
+
+Worker headroom completed all24 summaries PASS_FC12_CONFIRM (4saved ranks x
+2worker counts x3nodes). Same-node faster grouped-control latencies compared:
+144 workers rank0/1/2/3 slowdowns1.09/3.93/2.99/-0.01%; rank2 69.729→71.815us.
+128 workers2.91/5.82/10.98/3.31%; rank2 69.668→77.318us.
+96 workers18.12/20.98/26.11/21.55%; rank2 69.808→88.033us.
+Single-group candidate tracks grouped control; no meaningful rescue at lower
+worker count. This quantifies standalone cost, not mixer benefit; rank2 is the
+largest saved workload, not a measured distributed critical path. 144 is the
+least costly cap (~2.09us rank2), but overlap must save more than that to pay off.
+No further E2E launches from this status check.
+
+Follow-up: nt4_lookup_worker_overlap.sh replicas0/1 launched tmux0/1 Oct30.
+Same saved inputs nt4-trtllm-matched128-20261023-112340,128requests,64generated,
+16samples x2rounds, layers7/32/68. Native CUTLASS continuation retained after
+join; no E2E throughput claims. Lookup/group1024, exponential activation,
+detachedtail fixed. No numerical waivers or library changes. Each node brackets
+144-overlap with152-overlap-start/end, plus152/144serial controls (serial controls
+first on replica1,last on replica0). Branch device/tail clocks only; internal
+expert-phase/warp instrumentation disabled. Compare matched rank/sample/layer
+expert,mixer,join and totalblock intervals; keep layer7skew separate. Do not
+infer causal dependencies by adding unrelated medians. Stopqueue on firstfailure.
+NVSHMEM import/install guard retained. Roots nt4-lookup-worker-overlap-r{0,1}-
+<timestamp>; launchlogs corresponding -launch.log. tmux2leftidle; tmux3E2E512
+untouched. Local bashsyntaxpassed; GPUvalidation pending.
+
+Matched worker overlap finished roots r0/r1-20261030-174910: all10arms PASS.
+Each arm384unique records (4ranks x2rounds x16samples x3layers), matching
+input_sha256,decode_step,active_requests,native_output_sha256 across allarms.
+Local downloadedrecords/analysis: /tmp/nt4-worker-overlap-results (temporary).
+Metric below median over32invocations of maxrank local join duration; not a
+cross-GPU synchronized global timestamp. Overlap152start/144/152end us:
+node0 L32 220.416/223.872/222.656; L68 310.576/306.224/309.088.
+node1 L32 221.280/226.240/221.504; L68 310.512/303.040/311.360.
+Relative faster152control: L32 +1.57/+2.24%slower; L68 -.93/-2.41%faster.
+L68 maxrank mixer_post_shared interval 178.944→155.728us node0 and
+180.896→153.952us node1 (fastercontrol used), while mixer_core ~96us unchanged.
+Tail reduction~13-15%; totaljoin improvement only~1-2.4%. L32 tail improves
+slightly but expertphasecost dominates. L7 controls vary~19-23%, rankskew
+changes whichrank waits; no workerbenefit inference. SerialL68 152→144:
+397.872→399.248 node0,398.704→399.792 node1. Thus smallL68 overlap benefit
+reproduces despite serialcost, but uniform144not universalwin.
+Subphase waits move: L68rank1 controls sometimes mixer_post~129us,sometimes
+norm/residual~94-100us;144moves delay into sharedFC1~45-59us. Do not attribute
+interval reductions to faster arithmetic or sum separate medians. Diagnostic
+marker overhead/nativecontinuation/inputreplacement preclude E2E speedclaim.
+No new launches. Candidate next direction layer-specific cap (retain152L32,
+144L68) or finer scheduling; measure uninstrumented full-model beforepromotion.
+
+E2E512 completed nt4-tanh-trt512-trt-first-20261030-174251 all6arms exitPASS.
+Mean tok/s two measuredrounds: CUTLASSstart15303.075,end15097.389;
+lookup expMega start16177.444,end16073.150; TRT15989.229; hardwareMega16329.496.
+Hardware vsTRT+2.128%;vsfasterexp+.940%. Expcontrols vsTRT+.525..1.177%.
+Expcontrol drift-.645%,CUTLASS-1.344%. Allarms actualpeak512,262144outputs,
+512/512decodegraphreplays,own-eagergraphEXACT. Same512prompts x512outputs,
+MXFP8 overlap,152workers,lookup,detachedtail; no timinginstrumentation.
+Numerical policies remain NOT_PASSED forTRT andhardware. Example TRT localref
+exception globalL2.0023324,worstrow.0366327,maxabs.325351 (firstexception,not
+whole-runmax). HardwareFC1exceptions present. Exactgeneratedsequences against
+CUTLASS: exp190/512,hardware186/512,TRT512/512 bothrounds. Notansweraccuracy.
+Single-node result shows modestMega speededgeat512,not universalvictory and
+notnumericalqualification; previous128/256clean comparisons favoredTRT.
+Local summary /tmp/nt4-e2e512-summary.json; authoritative serverroot above.
+
+Nov2 follow-up launched on fresh CMH nodes: tmux0 nvl72d055-T04 batch512
+(tanh-first thenTRT-first); tmux1 nvl72d169-T12 batch768(TRT-first thentanh-first).
+New wrappers nt4_tanh_trt_scale.sh and nt4_tanh_trt_scale_queue.sh; no kernel
+changes. Each order sixarms,512generatedtokens,2measuredrounds,2048tokenbudget,
+32GiB inherited statebuffer asserted againstsource manifest.152workers,
+lookup/group1024,detachedtail,exponential/hardware/TRT,CUTLASS bracketcontrols.
+NVSHMEM import/install guard; allnumericalexception labels retained. Batch768
+keeps32GiB initially: capacity/peakoccupancy must be checked, no silent admission
+threshold relaxation. Two100minute watchdogs bound eachqueue to allocation;
+stopfirstfailure includingOOM, no retries on possiblyunhealthyCUDAcontext.
+Launchlogs logs/nt4-scale-queue{512,768}-launch-20261102.log. Authoritative perarm
+commands/summary record finalargs. GPUvalidationpending; wrappersbashsyntaxpass.
+
+Nov2 numerical/accuracy follow-up on new tmux2/3 nodes; nodes0/1 untouched.
+Tmux2 nvl72d197-T15 completed nt4-tanh-fp64-audit-20261102-074051.
+New isolated nt4_tanh_fp64_audit.py/sh: recomputeFC1 CPUFP64 from saved operands,
+FP64activation and independentE8M0ceiling/nearest-evenE4M3 quantization; apply
+actual exp/hardware fragments on sameFP32inputs; reportFC2propagation using
+sameFP64downprojection. This reference intentionally omits FP32rcp/mul rounding;
+it is not bit-exact emulation or acceptancegate. Three snapshots from failure256
+142740: L14expert180,L7expert234/236. FC1 recompute matches savedFP64exactly.
+For FP64FC1 roundedtoFP32 inputs, exponential quantized output matchesFP64
+reference all3; hardware quantizedL2 .0097026/.0101344/.00009275 respectively.
+Using originalFP32FC1 reference, expert236exp crosses a boundary too; do not
+claim exponential implementation always gives nearest mathematical result.
+Weighted sameinputFC2 attribution rerun L14row155expert180: againststagedBF16
+FC2 L2 .00008011; weightedexpertchange/finalreferencenorm .0196144;
+finalrow .0198490. Consistent with upstreamroundingamplification, no new gate.
+All are savedfailure diagnostics, not modelaccuracy or universalerrorbounds.
+
+Tmux3 nvl72d249-T17 running nt4-tanh-answer-screen-20261102-074414.
+SourceOpenMath train_5M firstArrowshard:382143rows,281152eligibleunique;
+67conflictinglabelquestions excluded; excludeall2048tuningprompts and problems
+>4000characters. DeterministicSHA256selection seednt4-tanh-qualification-v1,
+512questions,4batchfiles of128 with explicit boxed-answer instruction.
+Use dataset expected_answer, never generated_solution. Tuning-disjoint only,
+NOT certified model-training-heldout or representative of fullbenchmark.
+Five arms perbatch: CUTLASSstart,expMega start,hardwareMega,expMega end,CUTLASSend;
+2048generatedtokens,1measuredround,wholemodeldecodegraphs/overlap,lookup/group1024,
+152workers,detachedtail,controlledGC. HWexplicitnumericalexceptions remain
+NOT_PASSED; otherguardsunchanged. Score onlyfirstEOS prefix (elsetokenlimit),
+lastcompleteboxedanswer via math-verify0.8.0 installedisolatednode-localvenv;
+scorer smokechecks pass. Reportmissing/unparseableanswers,unparseablegold,
+noEOSbylimit,WilsonCIs and pairedbootstrapdifference. Missingcandidateanswers
+countincorrect; unparseablegoldexcludedexplicitly. Save decodedresponses and
+firsttokenmismatchIDs/commonprefixes. Aftergeneration firstbatch earliesttwo
+mismatches queued through all-layercommon-prefixteacherforced logitprobe;
+fullvectors,margins,decodedtopIDs saved; nottimings or causalattribution.
+No disagreements skipsprobeexplicitly. Existing logitprobe logic reused with
+new nt4_tanh_accuracy_logits.py driver (no32/68-onlyrestriction). CPUsyntax,
+boxextracttests and remotescore smoke passed; fullgeneration/graphqualification
+pending. Timeout12000s boundsallocation,stopfailure. Authoritative launchlog:
+logs/nt4-tanh-answer-screen-launch-20261102.log. New scripts nt4_tanh_accuracy*
+only; no edits to kernel/model code active on nodes0/1. No CLAUDE.md changes.
+
+Tmux2 reused afteraudit for nt4_tanh_known_prefix.sh (Nov2). Completed128source
+nt4-tanh-trt128-trt-first-20261030-154915 linked into newisolatedsource view;
+oldresultsunmodified. Verifytwo-roundexpbracketrepeatability, thenearliesttwo
+exp-vsHWdisagreements replayed withallrequests forcedalongexpcontinuations.
+All-layerhardwareactivation,lookup/group1024,detachedtail; fixedprefix/schedule
+hashchecks,fulllogitvectors,margins/topIDs. This complements tmux3newpromptaccuracy;
+notnewthroughput or single-layercausalattribution. Launchlog
+logs/nt4-tanh-known-prefix128-launch-20261102.log. Perarm1800s watchdog.
+
+2026-11-02: 768 failure isolation and common-prefix evidence
+- tmux1 authorized queue: nt4_trt_validation_retry.py (new isolated bootstrap
+  nt4_trt_validation_isolation.py; shared adapters/kernels unchanged).
+  Launch log: logs/nt4-trt768-isolation-launch-20261102.log.
+  First reproduces original TRT arm's unrelated MegaMoE FC1 prerequisite rejection
+  and saves failed tensors. Proceeds only if expected rejection AND snapshots exist.
+  Then fresh MegaMoE exp control / isolated TRT / MegaMoE exp control, 768 requests,
+  512 generated tokens, full decode graphs, shortcut overlap. Isolated TRT checks
+  independent local reference plus all-reduced final reference, poison and graph
+  replay; existing explicit TRT exploratory exceptions remain NOT_PASSED.
+  This bootstrap is a research diagnostic, not a shipping validation change.
+- tmux2 completed: nt4-tanh-known-prefix128-20261102-075139/logits/comparison.json.
+  Both forced-identical-prefix cases have exact eager/graph replay. Request124
+  position1 changes A (1065) to The (2599): exp logits [12.8125,12.75], hardware
+  [12.75,12.875], logit relative L2 .016827082, maxabs .5. Request108 position2:
+  exp '.'(1046)=16.25, ')'(1041)=16.125; hardware both16.25 (argmax chooses ')').
+  Logit relative L2 .023502129, maxabs .81640625. Second flip is a tie, not a
+  positive winner margin. No layer/expert causal ablation or answer-accuracy claim.
+
+2026-11-02 tmux2 follow-up: complementary layer activation ablation
+- New standalone nt4_tanh_prefix_layer_ablation.py/.sh; no shared adapter changes.
+- Source: nt4-tanh-known-prefix128-20261102-075139/source (same saved two flips).
+- Four fresh arms: exponential control; hardware layers7..36 (first14 MoE layers);
+  hardware layers38..68 (last14); hardware all28. Explicit layer lists in outputs.
+- All requests forced to saved exponential continuation; compare exact prefix AND
+  schedule hash. Require own eager/graph exactness. Record logits for fixed pair
+  (exp winner, full-hardware winner), signed margin, candidate winner and top tokens.
+- Diagnostic only: finite numerical exceptions remain advisory NOT_PASSED. No timing
+  or answer-accuracy claim; complementary effects may interact nonlinearly.
+- Launch log: logs/nt4-tanh-prefix-layer-ablation-launch-20261102.log.
+
+2026-11-02 completed tmux0/1 results (two measured rounds per arm):
+512 tanh-first root nt4-tanh-trt512-tanh-first-20261102-071603:
+ CUTLASS start/end 15234/13348 tok/s (~12.4% drop; do not claim clean CUTLASS gain).
+ expMega start/end 16174/16180; TRT16154; hardwareMega16264 (+0.68% vs TRT).
+512 TRT-first root nt4-tanh-trt512-trt-first-20261102-081025:
+ CUTLASS15020/15410; expMega16050/16217; TRT15946; hardwareMega16162 (+1.36%).
+ Hardware does not consistently beat faster exponential control (second order:
+ 16162 vs16217). Evidence for hardware-specific upside remains small/noisy.
+768 isolation root nt4-trt768-validation-isolation-20261102-082205:
+ expMega17276/17238; TRT16974. expMega +1.55..1.78%, control drift -0.22%.
+ Original failure reproduced AND snapshot saved at capture-original/fc1-failure/
+ layer59/expert84-rank0.pt. TRT independent-validation isolation completed.
+ TRT 448 recombined reference records: max globalL2 .00271795923,
+ max rowL2 .01184029225, maxabs3.76763916. No recombined gate exceptions;
+ 16 local-reference exception records (including rank duplicates), NOT_PASSED.
+ All measured arms reached requested512/768; equal512 output tokens/request,
+ full model graphs+shortcut overlap. TRT and hardware remain exploratory;
+ exponential controls had no numerical exception records in these runs.
+
+Completed tmux2 layer ablation nt4-tanh-prefix-layer-ablation128-20261102-083128:
+All8 records same-prefix/schedule and exact own eager/graph. Signed margins
+(exp winner minus full-HW winner), request124 A-The / request108 dot-closeparen:
+ control +.0625 / +.125; early-half -.25 / 0; late-half 0 / +.125;
+ all-hardware -.125 / 0. Early half alone sufficient to reproduce both argmax
+ flips (second is tie). Late half changes A/The to tie but keeps A via argmax,
+ retains dot winner. Does not localize a single layer or prove late half harmless.
+ Effects nonadditive; no answer-accuracy inference from these two cases.
+Consolidated local eight-run table: Downloads/nt4-e2e-consolidated-20261102/
+throughput-all-completed.csv. 768 initial hardware result is a different run from
+isolated TRT retry; do not compute paired hardware/TRT speedup across them.
+
+2026-11-02 follow-ups authorized/launched on idle nodes0/1/2:
+0: nt4_tanh_trt768_matched.sh/.py: fresh exp control / HW Mega / isolated TRT /
+ exp control, 768 requests512 outputs. Same saved command/environment as original;
+ independent TRT validation bootstrap retained; numerical exceptions NOT_PASSED.
+1: nt4_exp768_fp64_audit.sh/.py: saved L59expert84 rejection, independent FC1FP64,
+ exp/HW fragment on identical inputs, independent E4M3/E8M0 quantization, FC2
+ propagation, up to256 actual-vs-ideal boundary examples. Diagnostic not a proof;
+ actual kernel accumulators unavailable, no weighted-final claim (no token snapshot).
+2: nt4_tanh_prefix_quarter_ablation.sh/.py: fresh control, first7MoE layers,
+ next7MoE layers, all-layer HW endpoint. Same forced prefix/schedule, graph/eager
+ exact check. Keeps earlier group complement result; effects need not add.
+Launch logs use respective script stem + '-launch-20261102.log' in logs/.
+Only new standalone files uploaded; no shared kernel/model/adapter edits.
+
+Completed matched768 nt4-tanh-trt768-matched-isolated-20261102-093305:
+exp controls17202.890/17253.263; hardware17551.033; TRT17134.819 tok/s.
+HW +2.429% vs TRT, +1.726% vs faster exp control; exp drift+.293%.
+All measured rounds reach768,393216outputs,modelgraphs true. All4exit0.
+HW exceptions72expert/12output log records (rank duplication); TRT16local
+exception records. TRT final maxglobalL2 .002717959, maxrow .011840292.
+No numerical exception records for exp controls. Speed win, not qualification.
+Updated consolidated CSV/HTML/PNG with matched row and same-run 768 star.
+
+Completed quarter ablation nt4-tanh-prefix-quarter128-20261102-093305:
+All arms identical prefix/schedule, exact own eager/graph.
+Q1 layers[7,9,11,14,16,18,20]: request124 logits identical to control (L2=0),
+ A remains winner margin+.0625; request108 dot/closeparen ties at16.25,
+ argmax pickscloseparen, L2 .0238088.
+Q2 layers[23,25,27,29,32,34,36]: request124 A12.5625/The12.8125 ->The,
+ margin-.25,L2 .0203415; request108 dot/closeparen ties16.25, L2 .0223287.
+All-HW endpoint reproduces earlier results. Thus Q2 alone sufficient for A->The;
+Q1 alone has no final-logit effect for that request. Either Q1 or Q2 sufficient
+for punctuation tie, so cannot attribute that case to a unique culprit layer.
+Next useful localization: single-layer substitutions within Q2 for request124;
+no answer-accuracy inference from these two selected cases. tmux3 untouched.
+
+Accuracy recovery authorized on fresh tmux0 after original exit124.
+nt4_accuracy_resume_batch.sh/.py creates new nt4-tanh-answer-resumed-* root,
+symlinks original data and completed batches0--2, verifies/reuses batch3's saved
+baseline-start command+outputs, executes only four missing arms. Then scores all
+512 and runs separate batch0 prefix diagnostics if discrepancies exist. Source
+root remains unchanged. Resumed batch3 accuracy only (cross-node controls).
+Launch log logs/nt4-accuracy-resume-launch-20261102.log. New node NVSHMEM checked/
+installed by setup. First shell submission concatenated pre-existing unsent'exit'
+and failed before script execution; clean retry submitted.
+
+Accuracy recovery completed: nt4-tanh-answer-resumed-20261102-111354.
+All512 processed; own-controls exact check passed in scorer. BUT screen not useful
+for qualification: CUTLASS/exp/HW all480/512firsttoken2(EOS), scored textempty.
+Harness ignore_eos=True for fixedlength generation. Missing/unparseable answers
+502exp/503HW; raw correct2/3, not evidence of accuracy equivalence. Allgold parsed.
+272/512 full2048token sequences exact; many tokens occur afterEOS, so do not present
+as natural stopped-response agreement. Prefix replay completed but new sample
+positions may be afterEOS; assess semantics before using them as talk examples.
+Need small baseline sanity check of checkpoint/prompt formatting/tokenizer/EOS
+before any broader accuracy rerun. Do not discard leadingEOS merely to improve
+score. Existing performance timings remain fixedlength throughput, not qualified
+useful-answer throughput. Talk accuracy status corrected.
+
+User confirms accuracy checkpoint is a BASE model. Original instruction-style
+prompt was not qualified for it. HF tokenizer add_eos=false, no postprocessor;
+build_requests tokenizes raw text without applying chat template. Existing
+chat_template simply joins message content/newlines. EOS2 is genuinely special.
+Next: small nativeCUTLASS probe on tmux0,4questions x4formats(original,newline,
+Q/A,fewshot worked examples),normalEOS2,128maxoutputs,eager,16requests. Saves raw
+prompt/output IDs and decoded texts. No Mega substitution, no EOS suppression,
+no score-based prompt selection; sanity check before broad accuracy rerun.
+Launch logs/nt4-base-prompt-probe-launch-20261102.log.

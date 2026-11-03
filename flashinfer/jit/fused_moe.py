@@ -220,6 +220,11 @@ def gen_cutlass_fused_moe_module(
     nvcc_flags, module_name = _nt4_block_cap_build_config(
         nvcc_flags, device_arch, module_name
     )
+    if os.environ.get("NT4_CUTLASS_FC1_SNAPSHOT_BUILD") == "1":
+        if device_arch != "103":
+            raise ValueError("NT4 FC1 snapshot requires SM103")
+        module_name = (module_name or f"fused_moe_{device_arch}") + "_nt4_fc1_snapshot_v1"
+        nvcc_flags = [*nvcc_flags, "-DFLASHINFER_NT4_FC1_SNAPSHOT=1"]
 
     # Use FLASHINFER_GEN_SRC_DIR (user's writable cache) instead of FLASHINFER_CSRC_DIR
     # (package directory which may be read-only after installation)
@@ -359,6 +364,12 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
     bmm_checksum = CheckSumHash.TRTLLM_GEN_BMM
     module_name = "fused_moe_trtllm_sm107" if enable_rubin else "fused_moe_trtllm_sm100"
     rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
+    if os.environ.get("NT4_EXPERT_INTERNAL_TIMING") == "1":
+        module_name += "_internal_phases_v1"
+        rubin_flags += ["-DFLASHINFER_NT4_INTERNAL_TIMING=1"]
+    if os.environ.get("NT4_CUBIN_TRACE") == "1":
+        module_name += "_cubin_trace_v1"
+        rubin_flags += ["-DFLASHINFER_NT4_CUBIN_TRACE=1"]
     include_path = f"{bmm_path}/include"
     header_name = "flashinferMetaInfo"
 

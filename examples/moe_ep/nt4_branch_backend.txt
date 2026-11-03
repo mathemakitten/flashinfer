@@ -1,0 +1,63 @@
+BF16 shortcut branch comparison
+==============================
+Run after syncing the FlashInfer checkout:
+  bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_branch_backend.sh"
+Requires PY, FLASHINFER_CHECKOUT, MCORE_CHECKOUT, NT4_LOG_DIR.
+Uses the existing MCore branch-probe hooks; no new MCore edit is required.
+
+Four separate model loads: vllm-overlap (records input sequence),
+direct-overlap, direct-serial, vllm-serial. Direct uses group1024/cap74.
+128 requests, 64 generated tokens, two measured rounds, layers 7/32/68.
+Device timestamp calibration runs first. Full decode model graphs remain on.
+
+During measured rounds every decode invocation records/replays the selected
+blocks' hidden-state tensors before the timed fork. Replay rejects different
+occupancy, missing graph shapes, and unequal copied tensors. The summary checks
+all ranks, rounds, sampled decode indices, and hidden-state hashes. Warmup and
+ordinary eager/graph correctness validation run with replacement disabled. Each
+replayed measured round also runs an eager reference with the same recorded
+inputs, seeds, and reset engine state. The exact graph-output gate compares
+against that reference. Eager reference runs do not emit branch timing rows.
+
+This is a controlled block-input diagnostic, not natural generation performance.
+Copy/select, host I/O, and per-step synchronization perturb execution; no E2E
+throughput claim is valid. Input replacement deliberately changes generation.
+KV/recurrent cache contents are not independently hashed. Native prefill is
+unchanged and the recorded sequence is forced from the first measured decode
+step, but inspect mixer_core timings before attributing all differences to
+contention. Other blocks retain their backend and overlap schedule.
+
+Inspect branch-backend-summary.json for per-rank/layer phase intervals, expert
+completion, tail completion, join, and which branch finishes last. Marker spans
+include scheduling waits. Preserve inputs/ until all replay arms finish.
+The inputs/ directory contains checkpoint-derived hidden states and can be large.
+
+Resume after syncing this fix
+----------------------------
+  export NT4_BRANCH_BACKEND_ROOT=/path/to/existing/nt4-branch-backend-TIMESTAMP
+  bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_branch_backend.sh" --resume
+Completed arms are retained. Incomplete arm outputs are archived before retry.
+The completed vLLM input recording is reused. Calibration runs again.
+
+MXFP8 matched-input diagnostic
+-----------------------------
+  export NT4_BRANCH_PRECISION=mxfp8
+  export NT4_BRANCH_BACKEND_ROOT="$NT4_LOG_DIR/nt4-branch-mxfp8-$(date +%Y%m%d-%H%M%S)"
+  bash "$FLASHINFER_CHECKOUT/examples/moe_ep/nt4_branch_backend.sh"
+
+Four arms: baseline-overlap, direct-overlap, direct-serial, baseline-serial.
+Here baseline means FlashInfer CUTLASS MXFP8 + NVLS. It records the input sequence.
+All arms use native FlashInfer prefill, full decode graphs and controlled GC.
+The native vLLM expert cap is zero. MegaMoE uses the same MXFP8 configuration as
+its E2E run; BF16 group1024/cap74 knobs are not applied to MXFP8.
+The serial control serializes only the selected three blocks, not the whole model.
+The forced-input eager references and exact graph checks remain enabled.
+
+128 requests, 64 generated tokens, two timing rounds, 16 sampled steps per round,
+three selected layers, four ranks. Four checkpoint loads; preserve the root and
+use --resume if interrupted. Keep NT4_BRANCH_PRECISION=mxfp8 when resuming.
+Output: $NT4_BRANCH_BACKEND_ROOT/branch-backend-summary.json.
+This summary labels precision and native backend explicitly. Inspect layer 7
+for rank-arrival skew before drawing performance conclusions. Independent KV/
+recurrent-state equality is still not checked. No new MCore edits are needed
+beyond the existing branch hooks and validated MXFP8 shortcut integration.

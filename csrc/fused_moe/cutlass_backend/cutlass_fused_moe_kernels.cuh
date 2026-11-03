@@ -61,6 +61,10 @@
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
+#ifdef FLASHINFER_NT4_FC1_SNAPSHOT
+#include "nt4_fc1_snapshot.h"
+#endif
+
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
@@ -4434,6 +4438,23 @@ void CutlassMoeFCRunner<
                 alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr,
                 nullptr, enable_pdl);
     sync_check_cuda_error(stream);
+
+#ifdef FLASHINFER_NT4_FC1_SNAPSHOT
+    if constexpr (use_mxfp8) {
+      if (auto const* prefix = std::getenv("NT4_CUTLASS_FC1_SNAPSHOT_PREFIX")) {
+        TLLM_CHECK(use_fused_activation_epilogue && !use_lora);
+        nt4SnapshotFc1(prefix, gemm1_result, fc2_fp4_act_scale_,
+                       unpermuted_row_to_permuted_row, expert_first_token_offset_,
+                       num_rows, inter_size, experts_per_token, start_expert,
+                       num_experts_per_node,
+                       TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX,
+                       TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX,
+                       [&](int e, int64_t offset) {
+                         return getOffsetActivationSF(e, offset, inter_size, getScalingType());
+                       }, stream);
+      }
+    }
+#endif
 
     if (use_lora) {
       loraFC2(inter_size, hidden_size, num_experts_per_node, start_expert, num_valid_tokens_ptr,

@@ -437,6 +437,9 @@ struct MoEWorkspace {
   // Gemm1 intermediate outputs:
   int32_t ProjUpTileN{0};
   void* gemm1_output = nullptr;
+#ifdef FLASHINFER_NT4_INTERNAL_TIMING
+  int64_t* nt4_phase_ticks = nullptr;
+#endif
   float* gemm1_output_scale = nullptr;
 
   // Activation intermediate outputs:

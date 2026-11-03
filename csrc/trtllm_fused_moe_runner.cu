@@ -676,6 +676,14 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
   return std::distance(mPassingConfigs.begin(), it);
 }
 
+#ifdef FLASHINFER_NT4_INTERNAL_TIMING
+__global__ void nt4PhaseStamp(int64_t* ticks, int slot) {
+  unsigned long long tick;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tick));
+  ticks[slot] = static_cast<int64_t>(tick);
+}
+#endif
+
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
                  cudaStream_t stream, int64_t configIndex, bool enable_pdl) {
   FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
@@ -709,6 +717,9 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   float* const gemm1Alpha = useUnfusedActivation ? nullptr : args.gemm1_alpha;
   float* const gemm1Beta = useUnfusedActivation ? nullptr : args.gemm1_beta;
   float* const gemm1ClampLimit = useUnfusedActivation ? nullptr : args.gemm1_clamp_limit;
+#ifdef FLASHINFER_NT4_INTERNAL_TIMING
+  if (workspace.nt4_phase_ticks) nt4PhaseStamp<<<1, 1, 0, stream>>>(workspace.nt4_phase_ticks, 0);
+#endif
   mPermuteGemm1.run(
       args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
       args.gemm1_per_channel_weight_scale == nullptr ? workspace.token_scales
@@ -721,6 +732,10 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
       workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
       workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace, args.mUseRoutingScalesOnInput,
       device, stream, config.gemm1Config, enable_pdl, validHiddenSize, validIntermediateSize);
+
+#ifdef FLASHINFER_NT4_INTERNAL_TIMING
+  if (workspace.nt4_phase_ticks) nt4PhaseStamp<<<1, 1, 0, stream>>>(workspace.nt4_phase_ticks, 1);
+#endif
 
   // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
   void* gemm2_input = workspace.gemm1_output;
@@ -788,6 +803,9 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   // Run gemm2
   // Pass valid dimensions: validIntermediateSize (K for GEMM2), validHiddenSize (N for GEMM2)
   int32_t const gemm2HiddenSize = getGemm2OutputHiddenSize(args);
+#ifdef FLASHINFER_NT4_INTERNAL_TIMING
+  if (workspace.nt4_phase_ticks) nt4PhaseStamp<<<1, 1, 0, stream>>>(workspace.nt4_phase_ticks, 2);
+#endif
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
              args.gemm2_per_channel_weight_scale == nullptr ? workspace.token_scales_fc2
                                                             : gemm2_input_scale,
@@ -798,6 +816,10 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
              workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
              workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl,
              validIntermediateSize, validHiddenSize);
+
+#ifdef FLASHINFER_NT4_INTERNAL_TIMING
+  if (workspace.nt4_phase_ticks) nt4PhaseStamp<<<1, 1, 0, stream>>>(workspace.nt4_phase_ticks, 3);
+#endif
 
   // Run finalize
   if (args.do_finalize) {
